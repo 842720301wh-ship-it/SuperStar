@@ -1,5 +1,5 @@
 name: 刷课
- #
+ #黄
 on: 
   push:
     branches: [ main ]
@@ -29,9 +29,9 @@ jobs:
           cat > config.ini <<'EOF'
           [common]
           ; 手机号账号
-          username=13380351825
+          username=15113479049
           ; 登录密码
-          password=Lhxyly5200.
+          password=huangxv1028.
           ; 课程ID，逗号隔开（必填，留空在Actions里会因等待输入而报错）
           course_list=247370145
           ; 视频播放倍速(1~2)
