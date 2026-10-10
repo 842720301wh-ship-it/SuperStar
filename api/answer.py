@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import threading
 import time
+from functools import wraps
 from pathlib import Path
 from re import sub
 from typing import Optional
@@ -23,6 +24,32 @@ from api.logger import logger
 disable_warnings(exceptions.InsecureRequestWarning)
 
 __all__ = ["CacheDAO", "Tiku", "TikuFallback", "TikuYanxi", "TikuGo", "TikuLike", "TikuAdapter", "AI", "SiliconFlow"]
+
+
+def retry_ai_answer(func):
+    """AI 查询无有效答案或请求异常时重试一次，最多调用两次。"""
+    @wraps(func)
+    def wrapper(self, q_info):
+        for attempt in range(2):
+            try:
+                answer = func(self, q_info)
+                if q_info['type'] == 'completion':
+                    answer = normalize_completion_answer(answer, q_info.get('blank_count', 1))
+                elif q_info['type'] == 'shortanswer':
+                    answer = normalize_shortanswer_answer(answer)
+                elif isinstance(answer, str):
+                    answer = answer.strip()
+                if answer and check_answer(answer, q_info['type'], self):
+                    return answer
+            except Exception as exc:
+                logger.warning("AI 查询异常 ({}/2): {}", attempt + 1, type(exc).__name__)
+            if attempt == 0:
+                logger.warning("AI 未返回有效答案，稍后重试一次: {}", q_info['title'])
+                time.sleep(1)
+        logger.warning("AI 两次查询均未取得有效答案: {}", q_info['title'])
+        return None
+    return wrapper
+
 
 class CacheDAO:
     """
@@ -1023,6 +1050,7 @@ class AI(Tiku):
                 logger.debug(f"API请求间隔过短, 等待 {sleep_time} 秒")
                 time.sleep(sleep_time)
 
+    @retry_ai_answer
     def _query(self, q_info: dict):
         def remove_md_json_wrapper(md_str):
             # 使用正则表达式匹配Markdown代码块并提取内容
@@ -1033,9 +1061,9 @@ class AI(Tiku):
         if self.http_proxy:
             proxy = self.http_proxy
             httpx_client = httpx.Client(proxy=proxy)
-            client = OpenAI(http_client=httpx_client, base_url = self.endpoint,api_key = self.key)
+            client = OpenAI(http_client=httpx_client, base_url = self.endpoint,api_key = self.key, max_retries=0, timeout=30)
         else:
-            client = OpenAI(base_url = self.endpoint,api_key = self.key)
+            client = OpenAI(base_url = self.endpoint,api_key = self.key, max_retries=0, timeout=30)
         # 去除选项字母，防止大模型直接输出字母而非内容
         options_list = q_info['options'].split('\n')
         cleaned_options = [re.sub(r"^[A-Z]\s*", "", option) for option in options_list]
@@ -1179,6 +1207,7 @@ class SiliconFlow(Tiku):
         self.name = '硅基流动大模型'
         self.last_request_time = None
 
+    @retry_ai_answer
     def _query(self, q_info: dict):
         def remove_md_json_wrapper(md_str):
             # 解析可能存在的JSON包装

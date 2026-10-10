@@ -13,6 +13,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from functools import wraps
 from pathlib import Path
 from queue import PriorityQueue
 from typing import Any, Dict, List, Optional
@@ -342,11 +343,75 @@ class AnswerCacheTests(unittest.TestCase):
         cache.add_cache.assert_called_once_with("填空", "甲\n乙")
 
 
+class AIRetryTests(unittest.TestCase):
+    def setUp(self):
+        self.ns = {"wraps": wraps, "logger": Mock(), "time": Mock(), "check_answer": check_answer,
+                   "normalize_completion_answer": normalize_completion_answer,
+                   "normalize_shortanswer_answer": normalize_shortanswer_answer}
+        load_definitions("api/answer.py", {"retry_ai_answer"}, self.ns)
+        self.tiku = types.SimpleNamespace(true_list=["正确"], false_list=["错误"])
+        self.question = {"type": "shortanswer", "title": "测试问题"}
+
+    def query(self, raw_query, question=None):
+        return self.ns["retry_ai_answer"](raw_query)(self.tiku, question or self.question)
+
+    def test_success_does_not_retry(self):
+        raw = Mock(return_value="完整正文")
+        self.assertEqual(self.query(raw), "完整正文")
+        raw.assert_called_once()
+        self.ns["time"].sleep.assert_not_called()
+
+    def test_empty_response_retries_once(self):
+        for empty in (None, "", " ", [], {"Answer": []}):
+            with self.subTest(empty=empty):
+                raw = Mock(side_effect=[empty, "恢复后的正文"])
+                self.assertEqual(self.query(raw), "恢复后的正文")
+                self.assertEqual(raw.call_count, 2)
+
+    def test_network_exception_retries_once(self):
+        for error in (TimeoutError("timeout"), ConnectionError("offline")):
+            with self.subTest(error=error):
+                raw = Mock(side_effect=[error, "恢复后的正文"])
+                self.assertEqual(self.query(raw), "恢复后的正文")
+                self.assertEqual(raw.call_count, 2)
+
+    def test_second_failure_stops(self):
+        for failures in ([None, None], [TimeoutError(), ConnectionError()], [None, " "]):
+            with self.subTest(failures=failures):
+                raw = Mock(side_effect=failures)
+                self.assertIsNone(self.query(raw))
+                self.assertEqual(raw.call_count, 2)
+
+    def test_incomplete_blank_answer_retries(self):
+        raw = Mock(side_effect=[["甲"], ["甲", "乙"]])
+        self.assertEqual(self.query(raw, {"type": "completion", "title": "两空", "blank_count": 2}), ["甲", "乙"])
+        self.assertEqual(raw.call_count, 2)
+
+    def test_invalid_judgement_retries(self):
+        raw = Mock(side_effect=["不知道", "正确"])
+        self.assertEqual(self.query(raw, {"type": "judgement", "title": "判断题"}), "正确")
+        self.assertEqual(raw.call_count, 2)
+
+    def test_fallback_gets_ai_retry_before_next_provider(self):
+        ns = dict(self.ns, Optional=Optional)
+        load_definitions("api/answer.py", {"_query"}, ns, "TikuFallback")
+        first = Mock(name="ai")
+        raw = Mock(side_effect=[None, "AI 恢复后正文"])
+        first._query.side_effect = lambda q: self.query(raw, q)
+        second = Mock(name="other")
+        fallback = types.SimpleNamespace(providers=[first, second], name="回退题库")
+        self.assertEqual(ns["_query"](fallback, self.question), "AI 恢复后正文")
+        self.assertEqual(raw.call_count, 2)
+        second._query.assert_not_called()
+
+
 class AIAnswerTests(unittest.TestCase):
     def test_openai_shortanswer_string_and_array_are_parsed(self):
         client = Mock()
         ns = {"re": re, "json": json, "logger": Mock(), "time": Mock(), "OpenAI": Mock(return_value=client),
-              "normalize_shortanswer_answer": normalize_shortanswer_answer}
+              "normalize_shortanswer_answer": normalize_shortanswer_answer,
+              "normalize_completion_answer": normalize_completion_answer, "check_answer": check_answer, "wraps": wraps}
+        load_definitions("api/answer.py", {"retry_ai_answer"}, ns)
         load_definitions("api/answer.py", {"_query"}, ns, "AI")
         tiku = types.SimpleNamespace(http_proxy="", endpoint="test", key="test", model="test",
                                      _wait_for_interval=Mock(), _completion_kwargs=lambda **kwargs: kwargs)
@@ -357,19 +422,35 @@ class AIAnswerTests(unittest.TestCase):
                 self.assertEqual(ns["_query"](tiku, {"type": "shortanswer", "title": "简述原因", "options": ""}), expected)
                 prompt = client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
                 self.assertIn("简答题", prompt)
+                self.assertEqual(ns["OpenAI"].call_args.kwargs["max_retries"], 0)
+
+        client.chat.completions.create.reset_mock()
+        client.chat.completions.create.side_effect = [TimeoutError(), types.SimpleNamespace(choices=[
+            types.SimpleNamespace(message=types.SimpleNamespace(content='{"Answer":"网络恢复后的正文"}'))])]
+        self.assertEqual(ns["_query"](tiku, {"type": "shortanswer", "title": "简述原因", "options": ""}), "网络恢复后的正文")
+        self.assertEqual(client.chat.completions.create.call_count, 2)
 
     def test_siliconflow_shortanswer_has_prompt_and_preserves_text(self):
         requests = Mock()
         ns = {"re": re, "json": json, "logger": Mock(), "time": Mock(), "requests": requests,
-              "normalize_shortanswer_answer": normalize_shortanswer_answer}
+              "normalize_shortanswer_answer": normalize_shortanswer_answer,
+              "normalize_completion_answer": normalize_completion_answer, "check_answer": check_answer, "wraps": wraps}
+        load_definitions("api/answer.py", {"retry_ai_answer"}, ns)
         load_definitions("api/answer.py", {"_query"}, ns, "SiliconFlow")
-        tiku = types.SimpleNamespace(api_key="test", model_name="test", last_request_time=None, api_endpoint="test")
+        ns["time"].time.return_value = 100
+        tiku = types.SimpleNamespace(api_key="test", model_name="test", last_request_time=None, api_endpoint="test", min_interval=3)
         response = requests.post.return_value
         response.status_code = 200
         response.json.return_value = {"choices": [{"message": {"content": '{"Answer":"完整简答"}'}}]}
         self.assertEqual(ns["_query"](tiku, {"type": "shortanswer", "title": "简述原因", "options": ""}), "完整简答")
         prompt = requests.post.call_args.kwargs["json"]["messages"][0]["content"]
         self.assertIn("简答题", prompt)
+
+        requests.post.reset_mock()
+        failed_response = Mock(status_code=503, text="temporarily unavailable")
+        requests.post.side_effect = [failed_response, response]
+        self.assertEqual(ns["_query"](tiku, {"type": "shortanswer", "title": "简述原因", "options": ""}), "完整简答")
+        self.assertEqual(requests.post.call_count, 2)
 
 
 if __name__ == "__main__":
