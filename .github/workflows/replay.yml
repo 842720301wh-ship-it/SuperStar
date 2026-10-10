@@ -14,7 +14,7 @@ permissions:
 jobs:
   Replay:
     if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[replay-batch]') }}
-    name: 重跑原任务 #${{ matrix.original_run }}
+    name: '重跑原任务 #${{ matrix.original_run }}'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
