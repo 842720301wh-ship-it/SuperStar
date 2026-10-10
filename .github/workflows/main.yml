@@ -24,43 +24,41 @@ jobs:
           pip install -r ./requirements.txt 
           
       
-      - name: 生成配置文件
-        env:
-          CHAOXING_USERNAME: ${{ secrets.CHAOXING_USERNAME }}
-          CHAOXING_PASSWORD: ${{ secrets.CHAOXING_PASSWORD }}
-          CHAOXING_COURSE_LIST: ${{ secrets.CHAOXING_COURSE_LIST }}
-          AI_ENDPOINT: ${{ secrets.AI_ENDPOINT }}
-          AI_KEY: ${{ secrets.AI_KEY }}
-          AI_MODEL: ${{ secrets.AI_MODEL }}
+      - name: Run main.py
         run: |
-          cat > config.ini <<EOF
+          cat > config.ini <<'EOF'
           [common]
-          use_cookies=false
-          username=${CHAOXING_USERNAME}
-          password=${CHAOXING_PASSWORD}
-          course_list=${CHAOXING_COURSE_LIST}
+          ; 手机号账号
+          username=13288409952 
+          ; 登录密码
+          password=842720301wh 
+          ; 课程ID，逗号隔开（必填，留空在Actions里会因等待输入而报错）
+          course_list=266461666
+          ; 视频播放倍速(1~2)
           speed=1
+          ; 同时进行的章节数量（章节并发）
           jobs=1
+          ; 遇到关闭任务点时的行为: retry-重试, continue-继续
           notopen_action=retry
 
           [tiku]
           provider=AI
-          check_llm_connection=true
-          submit=true
-          cover_rate=0.9
-          delay=1.0
-          endpoint=${AI_ENDPOINT}
-          key=${AI_KEY}
-          model=${AI_MODEL}
+          ; AI 接口地址（一般需要带 /v1）、Key、模型名称
+          endpoint=https://api.longcat.chat/openai/v1
+          key=ak_2j642A6CX5Bv9hw6el92R30m9Yr2C
+          model=LongCat-2.0
+          ; AI 请求最小间隔，单位秒
           min_interval_seconds=3
           http_proxy=
+          ; 是否启动时检查AI连接
+          check_llm_connection=true
+          ; 是否自动提交答题: true-达到覆盖率后提交, false-只保存不提交
+          submit=true
+          ; 最低题库覆盖率，达到才提交
+          cover_rate=0.9
+          ; 搜索多个题目的间隔，单位秒
+          delay=1.0
           true_list=正确,对,√,是
           false_list=错误,错,×,否,不对,不正确
-
-          [notification]
-          provider=
-          url=
           EOF
-
-      - name: Run main.py
-        run: python main.py -c config.ini
+          python main.py -c config.ini
