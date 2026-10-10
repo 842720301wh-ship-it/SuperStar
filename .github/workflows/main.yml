@@ -33,7 +33,7 @@ jobs:
           ; 登录密码
           password=842720301wh 
           ; 课程ID，逗号隔开（必填，留空在Actions里会因等待输入而报错）
-          course_list=266461666
+          course_list=266461668
           ; 视频播放倍速(1~2)
           speed=1
           ; 同时进行的章节数量（章节并发）
