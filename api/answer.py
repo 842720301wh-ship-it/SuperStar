@@ -16,7 +16,7 @@ import requests
 from openai import OpenAI
 from urllib3 import disable_warnings, exceptions
 
-from api.answer_check import check_answer
+from api.answer_check import check_answer, normalize_completion_answer, normalize_shortanswer_answer
 from api.logger import logger
 
 # 关闭警告
@@ -218,11 +218,21 @@ class Tiku:
         # 先过缓存
         cache_dao = CacheDAO()
         answer = cache_dao.get_cache(q_info['title'])
+        if answer and q_info['type'] == 'completion':
+            blanks = normalize_completion_answer(answer, q_info.get('blank_count', 1))
+            answer = "\n".join(blanks) if blanks else None
+        elif answer and q_info['type'] == 'shortanswer':
+            answer = normalize_shortanswer_answer(answer)
         if answer:
             logger.info(f"从缓存中获取答案：{q_info['title']} -> {answer}")
             return answer.strip()
         else:
             answer = self._query(q_info)
+            if q_info['type'] == 'completion':
+                blanks = normalize_completion_answer(answer, q_info.get('blank_count', 1))
+                answer = "\n".join(blanks) if blanks else None
+            elif q_info['type'] == 'shortanswer':
+                answer = normalize_shortanswer_answer(answer)
             if answer:
                 answer = answer.strip()
                 logger.info(f"从{self.name}获取答案：{q_info['title']} -> {answer}")
@@ -369,6 +379,18 @@ class TikuFallback(Tiku):
             if not answer:
                 logger.info(f'{provider.name} 未命中，回退到下一个题库')
                 continue
+
+            if q_info['type'] == 'completion':
+                blanks = normalize_completion_answer(answer, q_info.get('blank_count', 1))
+                if blanks is None:
+                    logger.info(f'{provider.name} 填空答案不完整，回退到下一个题库')
+                    continue
+                answer = "\n".join(blanks)
+            elif q_info['type'] == 'shortanswer':
+                answer = normalize_shortanswer_answer(answer)
+                if answer is None:
+                    logger.info(f'{provider.name} 简答答案为空或格式无效，回退到下一个题库')
+                    continue
 
             # 若当前题库返回答案但类型不符，则继续回退。
             if check_answer(answer, q_info['type'], provider):
@@ -1055,7 +1077,7 @@ class AI(Tiku):
                 messages=[
                     {
                         "role": "system",
-                        "content": "本题为填空题，你必须根据语境和相关知识填入合适的内容，请根据题目回答问题，以json格式输出正确的答案，示例回答：{\"Answer\": [\"答案\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+                        "content": f"本题为填空题，共{q_info.get('blank_count', 1)}个空。按题目空位的先后顺序，每个空返回一个非空字符串，数组长度必须等于空位数量，不要合并答案或添加空位编号。仅输出JSON，例如：{{\"Answer\": [\"第一空答案\", \"第二空答案\"]}}。不要输出解释、Markdown或参考资料。"
                     },
                     {
                         "role": "user",
@@ -1083,7 +1105,7 @@ class AI(Tiku):
                 messages=[
                     {
                         "role": "system",
-                        "content": "本题为简答题，你必须根据语境和相关知识填入合适的内容，请根据题目回答问题，以json格式输出正确的答案，示例回答：{\"Answer\": [\"这是我的答案\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+                        "content": "本题为简答题。根据题意给出完整、简洁的正文，涵盖必要要点，可以分段或分点。仅输出JSON，格式为{\"Answer\": [\"第一段正文\", \"第二段正文\"]}，也可只返回一段。不要使用Markdown或添加答案之外的说明、参考资料。"
                     },
                     {
                         "role": "user",
@@ -1094,6 +1116,10 @@ class AI(Tiku):
 
         try:
             response = json.loads(remove_md_json_wrapper(completion.choices[0].message.content))
+            if q_info['type'] == 'completion':
+                return response['Answer']
+            if q_info['type'] == 'shortanswer':
+                return normalize_shortanswer_answer(response['Answer'])
             sep = "\n"
             return sep.join(response['Answer']).strip()
         except:
@@ -1173,9 +1199,11 @@ class SiliconFlow(Tiku):
         elif q_info['type'] == 'multiple':
             system_prompt = "本题为多选题，请选择所有正确选项，输出的是选项的具体内容，而不是内容前的ABCD，以JSON格式输出：示例回答：{\"Answer\": [\"选项1\",\"选项2\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
         elif q_info['type'] == 'completion':
-            system_prompt = "本题为填空题，请直接给出填空内容，以JSON格式输出：示例回答：{\"Answer\": [\"答案文本\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+            system_prompt = f"本题为填空题，共{q_info.get('blank_count', 1)}个空。按空位顺序，每个空返回一个非空字符串，数组长度必须等于空位数量，不要合并或编号。仅输出JSON，例如：{{\"Answer\": [\"第一空答案\", \"第二空答案\"]}}。不要输出解释、Markdown或参考资料。"
         elif q_info['type'] == 'judgement':
             system_prompt = "本题为判断题，请回答'正确'或'错误'，以JSON格式输出：示例回答：{\"Answer\": [\"正确\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+        elif q_info['type'] == 'shortanswer':
+            system_prompt = "本题为简答题。根据题意给出完整、简洁的正文，涵盖必要要点，可以分段或分点。仅输出JSON，例如：{\"Answer\": [\"第一段正文\", \"第二段正文\"]}。不要输出Markdown、额外说明或参考资料。"
 
         # 构造请求体
         payload = {
@@ -1218,6 +1246,10 @@ class SiliconFlow(Tiku):
                 result = response.json()
                 content = result['choices'][0]['message']['content']
                 parsed = json.loads(remove_md_json_wrapper(content))
+                if q_info['type'] == 'completion':
+                    return parsed['Answer']
+                if q_info['type'] == 'shortanswer':
+                    return normalize_shortanswer_answer(parsed['Answer'])
                 return "\n".join(parsed['Answer']).strip()
             else:
                 logger.error(f"API请求失败：{response.status_code} {response.text}")

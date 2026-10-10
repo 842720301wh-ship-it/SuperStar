@@ -27,6 +27,7 @@ class ChapterResult(enum.Enum):
     ERROR=1,
     NOT_OPEN=2,
     PENDING=3
+    INCOMPLETE=4
 
 
 def log_error(func):
@@ -262,15 +263,8 @@ def process_job(chaoxing: Chaoxing, course: dict, job: dict, job_info: dict, spe
                 course_id=course.get("courseId")
             )
             
-            # 启动直播处理线程
-            thread = threading.Thread(
-                target=LiveProcessor.run_live,
-                args=(live, speed),
-                daemon=True
-            )
-            thread.start()
-            thread.join()  # 等待直播处理完成
-            return StudyResult.SUCCESS
+            # process_job 已在线程池中运行，直接接收直播的执行结果。
+            return StudyResult.SUCCESS if LiveProcessor.run_live(live, speed) else StudyResult.ERROR
         except Exception as e:
             logger.error(f"处理直播任务时出错: {str(e)}")
             return StudyResult.ERROR
@@ -337,6 +331,16 @@ class JobProcessor:
         if self.retry_worker:
             self.retry_worker.join()
 
+        incomplete_tasks = [task for task in self.tasks if task.result != ChapterResult.SUCCESS]
+        logger.info("课程执行汇总: {}，共 {} 个章节，成功 {} 个，未完成 {} 个",
+                    self.course["title"], len(self.tasks),
+                    len(self.tasks) - len(incomplete_tasks), len(incomplete_tasks))
+        if incomplete_tasks:
+            for task in incomplete_tasks:
+                logger.error("未完成章节: {}，状态: {}，尝试次数: {}",
+                             task.point["title"], task.result.name, task.tries)
+            raise RuntimeError(f"课程「{self.course['title']}」有 {len(incomplete_tasks)} 个章节未完成")
+
 
     @log_error
     def worker_thread(self):
@@ -348,7 +352,11 @@ class JobProcessor:
                 logger.debug("Queue worker stopped")
                 return
 
-            task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed)
+            try:
+                task.result = process_chapter(self.chaoxing, self.course, task.point, self.speed)
+            except Exception:
+                logger.exception("处理章节失败: {}", task.point["title"])
+                task.result = ChapterResult.ERROR
 
             match task.result:
                 case ChapterResult.SUCCESS:
@@ -359,6 +367,7 @@ class JobProcessor:
                 case ChapterResult.NOT_OPEN:
                     if self.config["notopen_action"] == "continue":
                         logger.warning("章节未开启: {}, 正在跳过", task.point["title"])
+                        self.failed_tasks.append(task)
                         self.task_queue.task_done()
                         continue
 
@@ -368,11 +377,17 @@ class JobProcessor:
                             "章节未开启: {} 可能由于上一章节的章节检测未完成, 也可能由于该章节因为时效已关闭，"
                             "请手动检查完成并提交再重试。或者在配置中配置(自动跳过关闭章节/开启题库并启用提交)"
                         , task.point["title"])
+                        self.failed_tasks.append(task)
                         self.task_queue.task_done()
                         continue
 
                     # self.wait_queue.put(task)
                     self.retry_queue.put(task)
+
+                case ChapterResult.INCOMPLETE:
+                    logger.warning("章节任务仅保存或未处理，尚未完成: {}", task.point["title"])
+                    self.failed_tasks.append(task)
+                    self.task_queue.task_done()
 
                 case ChapterResult.ERROR:
                     task.tries += 1
@@ -423,9 +438,11 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
     if job_info.get("notOpen", False):
         return ChapterResult.NOT_OPEN
 
-    # 已经默认处理空任务，此处不需要判断
+    # 空页面请求的失败也必须传递到章节结果。
     if not jobs:
-        pass
+        empty_result = job_info.get("emptyPageResult")
+        if empty_result is not None and empty_result.is_failure():
+            return ChapterResult.ERROR
 
     # TODO: 个别章节很恶心，多到5个点，可以并行处理，将来会让不同课程不同章节的所有任务点共享一个队列，从而实现全局并行
     job_results:list[StudyResult]=[]
@@ -434,8 +451,11 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
             job_results.append(result)
     
     for result in job_results:
-        if result.is_failure():
+        if result.is_failure() and result != StudyResult.INCOMPLETE:
             return ChapterResult.ERROR
+
+    if StudyResult.INCOMPLETE in job_results:
+        return ChapterResult.INCOMPLETE
 
     return ChapterResult.SUCCESS
 
@@ -449,6 +469,8 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     point_list = chaoxing.get_course_point(
         course["courseId"], course["clazzId"], course["cpi"]
     )
+    if not point_list["points"]:
+        raise RuntimeError(f"课程「{course['title']}」未读取到章节，无法确认完成")
 
     # 为了支持课程任务回滚, 采用下标方式遍历任务点
 
@@ -462,10 +484,28 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
         task = ChapterTask(point=point, index=i)
         tasks.append(task)
     p = JobProcessor(chaoxing, course, tasks, config)
-    p.run()
-
-
-    tqdm.format_sizeof = _old_format_sizeof
+    try:
+        p.run()
+        # 以平台最新章节状态核验，防止队列处理结束被误认为课程完成。
+        for attempt in range(3):
+            latest_points = chaoxing.get_course_point(
+                course["courseId"], course["clazzId"], course["cpi"]
+            )["points"]
+            latest_by_id = {point["id"]: point for point in latest_points}
+            incomplete = []
+            for task in tasks:
+                point = latest_by_id.get(task.point["id"])
+                if point is None or (not point["has_finished"] and str(point.get("jobCount", 1)) != "0"):
+                    incomplete.append(task.point["title"])
+            if not incomplete:
+                logger.info("平台完成状态核验通过: {}", course["title"])
+                break
+            if attempt < 2:
+                time.sleep(2)
+        else:
+            raise RuntimeError(f"课程「{course['title']}」平台仍有未完成章节: {', '.join(incomplete)}")
+    finally:
+        tqdm.format_sizeof = _old_format_sizeof
 
 def filter_courses(all_course, course_list):
     """过滤要学习的课程"""
@@ -557,6 +597,7 @@ def main():
         sys.exit(e.code)
     except KeyboardInterrupt as e:
         logger.error(f"错误: 程序被用户手动中断, {e}")
+        sys.exit(130)
     except BaseException as e:
         logger.error(f"错误: {type(e).__name__}: {e}")
         logger.error(traceback.format_exc())

@@ -16,7 +16,7 @@ from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 
 from api.answer import *
-from api.answer_check import cut
+from api.answer_check import cut, normalize_completion_answer, normalize_shortanswer_answer
 from api.cipher import AESCipher
 from api.config import GlobalConst as gc
 from api.cookies import save_cookies, use_cookies
@@ -108,6 +108,7 @@ class StudyResult(Enum):
     FORBIDDEN = 1  # 403
     ERROR = 2
     TIMEOUT = 3
+    INCOMPLETE = 4  # 已保存或跳过，但任务点尚未完成
 
     def is_success(self):
         return self == StudyResult.SUCCESS
@@ -334,6 +335,8 @@ class Chaoxing:
         logger.trace("开始读取课程所有章节...")
         _resp = _session.get(_url)
 
+        _resp.raise_for_status()
+
         logger.trace(f"原始章节列表内容:\n{_resp.text}")
         logger.info("课程章节读取成功...")
         return decode_course_point(_resp.text)
@@ -361,9 +364,7 @@ class Chaoxing:
             cards_params.update({"num": _possible_num})
             _resp = _session.get("https://mooc1.chaoxing.com/mooc-ans/knowledge/cards", params=cards_params)
             if _resp.status_code != 200:
-                logger.error(f"未知错误: {_resp.status_code} 正在跳过")
-                logger.error(_resp.text)
-                return [], {}
+                raise RuntimeError(f"章节任务点读取失败: HTTP {_resp.status_code}")
 
             _job_list, _job_info = decode_course_card(_resp.text)
             if _job_info.get("notOpen", False):
@@ -375,7 +376,7 @@ class Chaoxing:
             job_info.update(_job_info)
 
         if not job_list:
-            self.study_emptypage(course, point)
+            job_info["emptyPageResult"] = self.study_emptypage(course, point)
 
         logger.trace(f"原始任务点列表内容:\n{_resp.text}")
         logger.info("章节任务点读取成功...")
@@ -670,8 +671,9 @@ class Chaoxing:
 
     def study_work(self, _course, _job, _job_info) -> StudyResult:
         # FIXME: 这一块可以单独搞一个类出来了，方法里面又套方法，每一次调用都会创建新的方法，十分浪费
-        if self.tiku.DISABLE or not self.tiku:
-            return StudyResult.SUCCESS
+        if not self.tiku or self.tiku.DISABLE:
+            logger.warning("题库未启用，章节检测尚未完成")
+            return StudyResult.INCOMPLETE
         _ORIGIN_HTML_CONTENT = ""  # 用于配合输出网页源码, 帮助修复#391错误
 
         def random_answer(options: str) -> str:
@@ -960,17 +962,21 @@ class Chaoxing:
                 elif q["type"] == "judgement":
                     answer = "true" if self.tiku.judgement_select(res) else "false"
                 elif q["type"] == "completion":
-                    if isinstance(res, list):
-                        answer = "".join(res)
-                    elif isinstance(res, str):
-                        answer = res
+                    blanks = normalize_completion_answer(res, q.get("blank_count", 1))
+                    if blanks and (q.get("blank_fields") or len(blanks) == 1):
+                        q["blank_answers"] = blanks
+                        answer = "\n".join(blanks)
+                    else:
+                        logger.warning("填空答案数量不符、存在空答案或未识别提交字段: {}", q["title"])
+                elif q["type"] == "shortanswer":
+                    answer = normalize_shortanswer_answer(res) or ""
                 else:
                     # 其他类型直接使用答案 （目前仅知有简答题，待补充处理）
                     answer = res
 
                 if not answer:  # 检查 answer 是否为空
-                    logger.warning(f"找到答案但答案未能匹配 -> {res}\t随机选择答案")
-                    answer = random_answer(q["options"])  # 如果为空，则随机选择答案
+                    logger.warning(f"找到答案但答案未能匹配 -> {res}")
+                    answer = "" if q["type"] in ("completion", "shortanswer") else random_answer(q["options"])
                     q[f'answerSource{q["id"]}'] = "random"
                 else:
                     logger.info(f"成功获取到答案：{answer}")
@@ -989,23 +995,29 @@ class Chaoxing:
         else:
             questions["pyFlag"] = "1"
             logger.info(f"章节检测题库覆盖率低于{self.tiku.COVER_RATE * 100:.0f}%，不予提交")
-        # 组建提交表单
-        if questions["pyFlag"] == "1":
-            for q in questions["questions"]:
-                questions.update(
-                    {
-                        f'answer{q["id"]}':
-                            q["answerField"][f'answer{q["id"]}'] if q[f'answerSource{q["id"]}'] == "cover" else '',
-                        f'answertype{q["id"]}': q["answerField"][f'answertype{q["id"]}'],
-                    }
-                )
-        else:
-            for q in questions["questions"]:
-                questions.update(
-                    {
-                        f'answer{q["id"]}': q["answerField"][f'answer{q["id"]}'],
-                        f'answertype{q["id"]}': q["answerField"][f'answertype{q["id"]}'],
-                    }
+        # 缺失填空答案时只保存，不能以选择题覆盖率掩盖未答的空。
+        if any(q["type"] == "completion" and not q.get("blank_answers") for q in questions["questions"]):
+            questions["pyFlag"] = "1"
+            logger.warning("存在未完整作答的填空题，仅保存，尚未完成任务")
+        if any(q["type"] == "shortanswer" and not q["answerField"][f'answer{q["id"]}'] for q in questions["questions"]):
+            questions["pyFlag"] = "1"
+            logger.warning("存在未作答的简答题，仅保存，尚未完成任务")
+        # 组建提交表单；填空题逐空写入页面字段，不拼成一个答案。
+        for q in questions["questions"]:
+            questions[f'answertype{q["id"]}'] = q["answerField"][f'answertype{q["id"]}']
+            if q["type"] == "completion" and q.get("blank_fields"):
+                blanks = q.get("blank_answers", [""] * q["blank_count"])
+                for name, blank in zip(q["blank_fields"], blanks):
+                    if name in questions:
+                        previous = questions[name]
+                        questions[name] = previous + [blank] if isinstance(previous, list) else [previous, blank]
+                    else:
+                        questions[name] = blank
+            else:
+                field_name = q.get("shortanswer_field", f'answer{q["id"]}')
+                questions[field_name] = (
+                    q["answerField"][f'answer{q["id"]}']
+                    if questions["pyFlag"] == "" or q[f'answerSource{q["id"]}'] == "cover" else ''
                 )
 
         del questions["questions"]
@@ -1040,6 +1052,9 @@ class Chaoxing:
         else:
             logger.error(f'{"提交" if questions["pyFlag"] == "" else "保存"}答题失败 -> {res.text}')
             return StudyResult.ERROR
+        if questions["pyFlag"] != "":
+            logger.warning("章节检测仅保存，尚未提交，任务点未完成")
+            return StudyResult.INCOMPLETE
         return StudyResult.SUCCESS
 
     def study_read(self, _course, _job, _job_info) -> StudyResult:

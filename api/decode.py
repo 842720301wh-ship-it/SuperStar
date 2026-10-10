@@ -450,7 +450,7 @@ def _process_question(div_tag, font_decoder=None) -> Dict[str, Any]:
     q_options.sort()
     q_options = '\n'.join(q_options)
     
-    return {
+    question = {
         "id": question_id,
         "title": q_title,
         "options": q_options,
@@ -460,6 +460,27 @@ def _process_question(div_tag, font_decoder=None) -> Dict[str, Any]:
             f"answertype{question_id}": q_type_code,
         },
     }
+    if q_type == "completion":
+        # 使用页面实际字段名，支持多空的 answerEditor<ID><序号>。
+        fields = []
+        for element in div_tag.find_all(["textarea", "input"]):
+            name = element.get("name", "")
+            if element.get("type", "").lower() == "hidden":
+                continue
+            if re.fullmatch(rf"answerEditor{re.escape(question_id)}\d+|answer{re.escape(question_id)}(?:_?\d+)?", name):
+                fields.append(name)
+        question["blank_fields"] = fields
+        question["blank_count"] = len(fields) or len(re.findall(r"_{2,}|＿{2,}|[（(]\s*[)）]", q_title)) or 1
+    elif q_type == "shortanswer":
+        question["shortanswer_field"] = f"answer{question_id}"
+        for element in div_tag.find_all(["textarea", "input"]):
+            name = element.get("name", "")
+            if element.get("type", "").lower() != "hidden" and re.fullmatch(
+                rf"answer{re.escape(question_id)}|answerEditor{re.escape(question_id)}(?:1)?", name
+            ):
+                question["shortanswer_field"] = name
+                break
+    return question
 
 
 def _get_question_type(type_code: str) -> str:
