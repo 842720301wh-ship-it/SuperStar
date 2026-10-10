@@ -1,0 +1,69 @@
+name: 批量重跑历史任务
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/replay.yml
+      - scripts/replay_config.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  Replay:
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[replay-batch]') }}
+    name: 重跑原任务 #${{ matrix.original_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - original_run: 24
+            source_sha: c319373c515a33fa7affba1b94f7ef735076ddfb
+          - original_run: 25
+            source_sha: 96d308aba1d09c9932435b8813e7385843d18873
+          - original_run: 26
+            source_sha: 750b68ee060bb5065bbd70d833418a681de9c3c9
+          - original_run: 27
+            source_sha: aa1df352d338c5a69f4617f8196cd7575cb5a4c8
+          - original_run: 28
+            source_sha: c6bc6cc393262d609f29aa1072fe995b872888d1
+          - original_run: 29
+            source_sha: 6cdc8e8a946744f099723270836e3abd486618aa
+          - original_run: 30
+            source_sha: 387b7456778cd761581c53a61120109d36c1aadd
+          - original_run: 31
+            source_sha: eb7f2f30670fc38fa34a43b4571a51042a315d0e
+          - original_run: 32
+            source_sha: b4150c59a329f5cacc7858c0779d9009e8cf5aef
+          - original_run: 33
+            source_sha: 87211b6de2fb9983904f2dbeabb4716fd707a3f6
+          - original_run: 34
+            source_sha: fd2b6e2204674c1fcbc5edf7320718719cc02c6e
+          - original_run: 35
+            source_sha: 7af7d16a6367a0ef484703e69cd3ec8fef34c81b
+          - original_run: 36
+            source_sha: 0f69705d35fa69d9252fe26966668c721d1ebecb
+          - original_run: 37
+            source_sha: 3760641acd8e5c73299f517ebb9423aeb6588bc7
+          - original_run: 38
+            source_sha: df22e981525cb4f776d3a265b6cd68af30f46959
+    steps:
+      - name: 获取最新代码及历史配置
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+      - name: 读取本任务原账号和课程配置
+        run: python scripts/replay_config.py "${{ matrix.source_sha }}"
+      - name: 使用最新代码执行
+        run: python -u main.py -c config.ini

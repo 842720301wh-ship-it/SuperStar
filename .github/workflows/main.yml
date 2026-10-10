@@ -9,6 +9,7 @@ on:
     
 jobs: 
   Start:
+    if: ${{ !contains(github.event.head_commit.message, '[replay-batch]') }}
     runs-on: ubuntu-latest # 在最新版本的 Ubuntu 操作系统环境下运行
     steps: # 要执行的步骤
       - name: 拷贝代码
@@ -55,7 +56,7 @@ jobs:
           ; 是否自动提交答题: true-达到覆盖率后提交, false-只保存不提交
           submit=true
           ; 最低题库覆盖率，达到才提交
-          cover_rate=0.9
+          cover_rate=0.5
           ; 搜索多个题目的间隔，单位秒
           delay=1.0
           true_list=正确,对,√,是
