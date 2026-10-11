@@ -194,9 +194,16 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
     # 处理所有附件任务
     cards = cards_data.get("attachments", [])
     # 保留已完成任务的 ID，供重跑及重复提交后的核验使用。
-    job_info["completed_job_ids"] = [str(card["jobid"]) for card in cards
-                                     if card.get("jobid") and is_passed(card.get("isPassed"))]
+    job_info["completed_job_ids"] = [str(card["jobid"]) for card in cards if card.get("jobid") and (
+        is_passed(card.get("isPassed")) or (card.get("type") == "workid" and card.get("job") is None)
+    )]
     job_list = _process_attachment_cards(cards)
+    job_info["card_parsed"] = True
+    decoded_ids = {str(job.get("jobid", "")) for job in job_list}
+    job_info["unprocessed_count"] = sum(
+        card.get("job") is not None and not is_passed(card.get("isPassed"))
+        and str(card.get("jobid", "")) not in decoded_ids for card in cards
+    )
 
     return job_list, job_info
 

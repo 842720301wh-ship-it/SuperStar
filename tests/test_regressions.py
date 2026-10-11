@@ -53,8 +53,9 @@ def main_namespace():
         "Chaoxing": object, "StudyResult": StudyResult, "logger": Mock(), "tqdm": Mock(),
         "Notification": Mock(), "LoginError": RuntimeError,
     })
-    load_definitions("main.py", {"ChapterResult", "log_error", "ChapterTask", "JobProcessor",
-                                "process_job", "process_chapter", "process_course", "format_time", "main"}, module.__dict__)
+    load_definitions("main.py", {"ChapterResult", "log_error", "ChapterTask", "JobProcessor", "str_to_bool",
+                                "process_job", "process_chapter", "process_course", "format_time", "main",
+                                "verify_chapter_finished", "run_sequential_chapters"}, module.__dict__)
     return module.__dict__
 
 
@@ -179,7 +180,7 @@ class WorkflowStatusTests(unittest.TestCase):
                 cx.get_course_point.side_effect = [{"points": [POINT]}] + [{"points": latest}] * 3
                 self.ns["process_chapter"] = Mock(return_value=self.ns["ChapterResult"].SUCCESS)
                 original = self.ns["tqdm"].format_sizeof
-                if not latest or latest == [POINT]:
+                if not latest or not latest[0]["has_finished"]:
                     with self.assertRaisesRegex(RuntimeError, "平台仍有未完成"):
                         self.ns["process_course"](cx, COURSE, dict(CONFIG))
                 else:

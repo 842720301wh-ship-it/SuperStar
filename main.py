@@ -434,7 +434,7 @@ class JobProcessor:
 def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, Any], speed:float) -> ChapterResult:
     """处理单个章节"""
     logger.info(f'当前章节: {point["title"]}')
-    if point["has_finished"]:
+    if point["has_finished"] and not point.get("verify_finished", False):
         logger.info(f'章节：{point["title"]} 已完成所有任务点')
         return ChapterResult.SUCCESS
     
@@ -472,6 +472,54 @@ def process_chapter(chaoxing: Chaoxing, course:dict[str, Any], point:dict[str, A
 
 
 
+def verify_chapter_finished(chaoxing, course, point):
+    """顺序解锁时同时核对最新章节标记和实际任务卡片。"""
+    for attempt in range(3):
+        latest = chaoxing.get_course_point(course["courseId"], course["clazzId"], course["cpi"])["points"]
+        current = next((item for item in latest if item["id"] == point["id"]), None)
+        if current is not None:
+            jobs, info = chaoxing.get_job_list(course, current, mark_empty=False)
+            confirmed_cards = info.get("completed_job_ids") or info.get("card_parsed") or str(current.get("jobCount", 1)) == "0"
+            if current["has_finished"] and confirmed_cards and not jobs and not info.get("notOpen") and not info.get("unprocessed_count"):
+                point.update(current)
+                return True
+            logger.warning("章节尚未通过平台核验: {}，章节完成={}，剩余任务={}，未开放={}",
+                           current["title"], current["has_finished"], len(jobs), bool(info.get("notOpen")))
+        if attempt < 2:
+            time.sleep(2)
+    return False
+
+
+def run_sequential_chapters(chaoxing, course, tasks, speed):
+    """完成并核验当前章节后再进入下一章，不抢先消耗后续章节重试。"""
+    logger.info("课程启用顺序解锁：逐章刷新状态，核验前一章后再继续")
+    for task in tasks:
+        for attempt in range(5):
+            task.tries = attempt + 1
+            try:
+                latest = chaoxing.get_course_point(course["courseId"], course["clazzId"], course["cpi"])["points"]
+                current = next((item for item in latest if item["id"] == task.point["id"]), None)
+                if current is None:
+                    raise RuntimeError("平台章节列表缺少当前章节")
+                task.point.update(current)
+                task.point["verify_finished"] = True
+                task.result = process_chapter(chaoxing, course, task.point, speed)
+                if task.result == ChapterResult.SUCCESS:
+                    if verify_chapter_finished(chaoxing, course, task.point):
+                        logger.info("顺序章节核验完成: {}", task.point["title"])
+                        break
+                    task.result = ChapterResult.INCOMPLETE
+            except Exception as exc:
+                logger.warning("顺序章节处理异常: {}，{}", task.point["title"], type(exc).__name__)
+                task.result = ChapterResult.ERROR
+            logger.warning("前置章节未完成，重试当前章节 ({}/5): {}，状态={}",
+                           attempt + 1, task.point["title"], task.result.name)
+            if attempt < 4:
+                time.sleep(2)
+        else:
+            raise RuntimeError(f"课程「{course['title']}」阻塞于前置章节「{task.point['title']}」，状态: {task.result.name}；后续章节尚未执行")
+
+
 def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     """处理单个课程"""
     logger.info(f"开始学习课程: {course['title']}")
@@ -494,9 +542,12 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
     for i, point in enumerate(point_list["points"]):
         task = ChapterTask(point=point, index=i)
         tasks.append(task)
-    p = JobProcessor(chaoxing, course, tasks, config)
     try:
-        p.run()
+        if point_list.get("hasLocked") or str_to_bool(config.get("sequential", False)):
+            run_sequential_chapters(chaoxing, course, tasks, config["speed"])
+        else:
+            p = JobProcessor(chaoxing, course, tasks, config)
+            p.run()
         # 以平台最新章节状态核验，防止队列处理结束被误认为课程完成。
         for attempt in range(3):
             latest_points = chaoxing.get_course_point(
@@ -506,7 +557,7 @@ def process_course(chaoxing: Chaoxing, course:dict[str, Any], config: dict):
             incomplete = []
             for task in tasks:
                 point = latest_by_id.get(task.point["id"])
-                if point is None or (not point["has_finished"] and str(point.get("jobCount", 1)) != "0"):
+                if point is None or not point["has_finished"]:
                     incomplete.append(task.point["title"])
             if not incomplete:
                 logger.info("平台完成状态核验通过: {}", course["title"])

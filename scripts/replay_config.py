@@ -26,6 +26,7 @@ def parse_workflow_config(workflow_text):
 
 def write_replay_config(workflow_text, output_path):
     config = parse_workflow_config(workflow_text)
+    config.set("common", "sequential", "true")
     config.set("tiku", "cover_rate", "0.5")
     config.set("tiku", "submit", "true")
     config.set("tiku", "auto_submit", "true")

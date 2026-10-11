@@ -32,7 +32,9 @@ class ReplayConfigTests(unittest.TestCase):
                 path = Path(tmp) / "config.ini"
                 original = parse_workflow_config(workflow(account, course))
                 actual = write_replay_config(workflow(account, course), path)
-                self.assertEqual(dict(actual["common"]), dict(original["common"]))
+                self.assertEqual({key: value for key, value in actual["common"].items() if key != "sequential"},
+                                 dict(original["common"]))
+                self.assertEqual(actual["common"]["sequential"], "true")
                 self.assertEqual(actual["tiku"]["key"], "test-key")
                 self.assertEqual(actual["tiku"]["cover_rate"], "0.5")
                 self.assertEqual(actual["tiku"]["auto_submit"], "true")

@@ -26,6 +26,7 @@ from api.decode import (
     decode_course_card,
     decode_course_folder,
     decode_questions_info,
+    is_passed,
 )
 from api.exceptions import MaxRetryExceeded
 
@@ -347,6 +348,8 @@ class Chaoxing:
         job_list = []
         job_info = {}
         completed_job_ids = set()
+        parsed_cards = False
+        unprocessed_count = 0
         cards_params = {
             "clazzid": course["clazzId"],
             "courseid": course["courseId"],
@@ -374,13 +377,21 @@ class Chaoxing:
                 return [], _job_info
 
             completed_job_ids.update(_job_info.get("completed_job_ids", []))
+            parsed_cards = parsed_cards or _job_info.get("card_parsed", False)
+            unprocessed_count += _job_info.get("unprocessed_count", 0)
             for job in _job_list:
                 job["card_num"] = _possible_num
             job_list += _job_list
             job_info.update(_job_info)
 
         job_info["completed_job_ids"] = sorted(completed_job_ids)
-        if mark_empty and not job_list and not completed_job_ids:
+        job_info["card_parsed"] = parsed_cards
+        job_info["unprocessed_count"] = unprocessed_count
+        if unprocessed_count:
+            raise RuntimeError(f"章节有 {unprocessed_count} 个无法解析的未完成任务点")
+        if not job_list and not completed_job_ids and not parsed_cards and str(point.get("jobCount", 1)) != "0":
+            raise RuntimeError("章节仍有任务点但未读取到有效任务卡片，不能当作空页面完成")
+        if mark_empty and not point.get("has_finished") and not job_list and not completed_job_ids:
             job_info["emptyPageResult"] = self.study_emptypage(course, point)
         elif not job_list:
             logger.info("该章节的任务点已完成，跳过执行")
@@ -391,7 +402,7 @@ class Chaoxing:
         return job_list, job_info
 
     def is_job_finished(self, course: dict, job: dict, job_info: dict) -> bool:
-        """重新读取任务卡片，只凭当前任务的 isPassed 确认完成。"""
+        """核对当前任务通过标记或平台已移除作业待完成标记。"""
         session = SessionManager.get_session()
         card_numbers = [job["card_num"]] if "card_num" in job else "0123456"
         for number in card_numbers:
@@ -493,7 +504,7 @@ class Chaoxing:
                 resp = _session.get(_url, params=params, headers=headers)
                 if resp.status_code == 200:
                     logger.trace(resp.text)
-                    return resp.json()["isPassed"], 200
+                    return is_passed(resp.json()["isPassed"]), 200
                 # elif resp.ok:
                 #    # TODO: 处理验证码
                 #    pass
@@ -509,7 +520,7 @@ class Chaoxing:
 
         if resp.status_code == 200:
             logger.trace(resp.text)
-            return resp.json()["isPassed"], 200
+            return is_passed(resp.json()["isPassed"]), 200
 
         elif resp.status_code == 403:
             logger.debug(

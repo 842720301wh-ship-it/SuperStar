@@ -56,6 +56,22 @@ class CompletionParsingTests(unittest.TestCase):
             self.assertEqual(jobs, [])
             self.assertFalse(info.get("completed_job_ids"))
 
+    def test_platform_removes_job_flag_from_finished_work(self):
+        # 实际只读核对：已完成作业没有 isPassed，平台移除了 job 标记。
+        card = work_card(passed=None)
+        card.pop("job")
+        jobs, info = self.ns["decode_course_card"](card_page([card]))
+        self.assertEqual(jobs, [])
+        self.assertEqual(info["completed_job_ids"], ["work-j"])
+        self.assertEqual(info["unprocessed_count"], 0)
+
+    def test_unknown_active_task_cannot_be_treated_as_finished(self):
+        card = work_card()
+        card["type"] = "unknown"
+        jobs, info = self.ns["decode_course_card"](card_page([card]))
+        self.assertEqual(jobs, [])
+        self.assertEqual(info["unprocessed_count"], 1)
+
     def test_chapter_completion_checks_all_tips_and_unlock_state(self):
         for tips, count, finished in ((["剩余任务", "已完成"], "2", True),
                                       (["未完成"], "2", False),
@@ -124,6 +140,43 @@ class CompletionRequestTests(unittest.TestCase):
         self.session.get.return_value = response
         with self.assertRaises(OSError):
             self.ns["is_job_finished"](self.cx, COURSE, {"jobid": "work-j", "card_num": "0"}, {"knowledgeid": "k"})
+
+    def test_unreadable_task_cards_cannot_mark_empty_page_completed(self):
+        self.session.get.return_value = self.response("登录页或异常页面")
+        with self.assertRaisesRegex(RuntimeError, "未读取到有效任务卡片"):
+            self.ns["get_job_list"](self.cx, COURSE, POINT)
+        self.cx.study_emptypage.assert_not_called()
+
+    def test_readonly_inspection_never_marks_empty_page_completed(self):
+        self.session.get.return_value = self.response(card_page([]))
+        self.ns["get_job_list"](self.cx, COURSE, POINT, mark_empty=False)
+        self.cx.study_emptypage.assert_not_called()
+
+    def test_finished_work_without_ispassed_can_be_confirmed(self):
+        card = work_card(passed=None)
+        card.pop("job")
+        self.session.get.return_value = self.response(card_page([card]))
+        self.assertTrue(self.ns["is_job_finished"](self.cx, COURSE,
+            {"jobid": "work-j", "card_num": "1"}, {"knowledgeid": "k"}))
+
+    def test_video_log_does_not_treat_string_false_as_passed(self):
+        ns = {"logger": Mock(), "re": re, "Optional": Optional,
+              "requests": types.SimpleNamespace(Session=object),
+              "is_passed": decode_namespace()["is_passed"], "get_timestamp": lambda: "0"}
+        load_definitions("api/base.py", {"video_progress_log"}, ns, "Chaoxing")
+        cx = types.SimpleNamespace(video_log_limiter=Mock(), get_enc=Mock(return_value="e"),
+                                   get_uid=Mock(return_value="u"))
+        job = {"jobid": "j", "objectid": "o", "otherinfo": "nodeId_1-", "rt": "1",
+               "videoFaceCaptureEnc": "", "attDuration": "", "attDurationEnc": ""}
+        for rt in ("1", ""):
+            job["rt"] = rt
+            for flag, expected in (("false", False), ("0", False), (False, False), ("true", True), (True, True)):
+                with self.subTest(rt=rt, flag=flag):
+                    session = Mock()
+                    session.get.return_value = types.SimpleNamespace(status_code=200, text="{}", json=lambda: {"isPassed": flag})
+                    passed, state = ns["video_progress_log"](cx, session, COURSE, job, {}, "token", 100, 100, headers={"test": "1"})
+                    self.assertIs(passed, expected)
+                    self.assertEqual(state, 200)
 
 
 if __name__ == "__main__":
