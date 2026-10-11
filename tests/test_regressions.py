@@ -135,6 +135,32 @@ class WorkflowStatusTests(unittest.TestCase):
         self.ns["process_chapter"] = Mock(side_effect=[ValueError("transient"), self.ns["ChapterResult"].SUCCESS])
         self.assertEqual(self.run_processor(self.processor()), [])
 
+    def test_stale_failure_recovers_only_after_platform_confirms_completion(self):
+        for result in ("ERROR", "INCOMPLETE", "NOT_OPEN"):
+            with self.subTest(result=result):
+                self.ns["process_chapter"] = Mock(return_value=self.ns["ChapterResult"][result])
+                p = self.processor()
+                p.chaoxing.get_course_point.return_value = {"points": [dict(POINT, has_finished=True)]}
+                self.assertEqual(self.run_processor(p), [])
+                self.assertEqual(p.tasks[0].result, self.ns["ChapterResult"].SUCCESS)
+                self.assertEqual(p.failed_tasks, [])
+
+    def test_missing_or_unreadable_platform_state_does_not_clear_failure(self):
+        for response in ({"points": []}, {"points": [POINT]}):
+            self.ns["process_chapter"] = Mock(return_value=self.ns["ChapterResult"].INCOMPLETE)
+            p = self.processor()
+            p.chaoxing.get_course_point.return_value = response
+            self.assertIsInstance(self.run_processor(p)[0], RuntimeError)
+        p = self.processor()
+        p.chaoxing.get_course_point.side_effect = OSError("offline")
+        self.assertIsInstance(self.run_processor(p)[0], RuntimeError)
+
+    def test_completed_chapter_skips_all_job_requests(self):
+        cx = Mock()
+        self.assertEqual(self.ns["process_chapter"](cx, COURSE, dict(POINT, has_finished=True), 1),
+                         self.ns["ChapterResult"].SUCCESS)
+        cx.get_job_list.assert_not_called()
+
     def test_saved_work_is_incomplete_chapter(self):
         cx = Mock()
         cx.get_job_list.return_value = ([{"type": "workid"}], {})
@@ -195,7 +221,8 @@ class WorkSubmissionTests(unittest.TestCase):
         self.session.post.return_value = types.SimpleNamespace(status_code=200, json=lambda: {"status": True, "msg": "ok"})
         self.tiku = Mock(DISABLE=False, COVER_RATE=0.9)
         self.tiku.get_submit_params.return_value = ""
-        self.cx = types.SimpleNamespace(tiku=self.tiku, kwargs={}, rollback_times=0)
+        self.cx = types.SimpleNamespace(tiku=self.tiku, kwargs={}, rollback_times=0,
+                                        is_job_finished=Mock(return_value=False))
         self.ns = {"StudyResult": StudyResult, "logger": Mock(), "re": re, "random": random,
                    "time": types.SimpleNamespace(sleep=Mock()), "SequenceMatcher": SequenceMatcher,
                    "SessionManager": types.SimpleNamespace(get_session=lambda: self.session),
@@ -280,6 +307,46 @@ class WorkSubmissionTests(unittest.TestCase):
     def test_disabled_tiku_does_not_pass(self):
         self.cx.tiku = None
         self.assertEqual(self.ns["study_work"](self.cx, COURSE, {}, {}), StudyResult.INCOMPLETE)
+
+    def test_completed_work_skips_ai_and_submission(self):
+        self.cx.is_job_finished.return_value = True
+        result = self.ns["study_work"](self.cx, COURSE, {"jobid": "work-j"}, {"knowledgeid": "k"})
+        self.assertEqual(result, StudyResult.SUCCESS)
+        self.tiku.query.assert_not_called()
+        self.session.get.assert_not_called()
+        self.session.post.assert_not_called()
+
+    def test_completed_work_is_recognized_with_tiku_disabled(self):
+        self.cx.tiku = None
+        self.cx.is_job_finished.return_value = True
+        self.assertEqual(self.ns["study_work"](self.cx, COURSE, {"jobid": "work-j"}, {"knowledgeid": "k"}),
+                         StudyResult.SUCCESS)
+        self.session.post.assert_not_called()
+
+    def test_reviewed_rejection_requires_explicit_task_completion(self):
+        self.session.post.return_value = types.SimpleNamespace(
+            status_code=200, json=lambda: {"status": False, "msg": "已批阅作业，不允许重复提交！"})
+        for confirmed in (True, False):
+            with self.subTest(confirmed=confirmed):
+                self.cx.is_job_finished.side_effect = [False, confirmed]
+                result, _ = self.run_work(["甲", "乙"])
+                self.assertEqual(result, StudyResult.SUCCESS if confirmed else StudyResult.ERROR)
+
+    def test_reviewed_page_skips_question_parser_only_after_confirmation(self):
+        self.session.get.return_value = types.SimpleNamespace(status_code=200, text="作业已批阅")
+        self.cx.is_job_finished.side_effect = [False, True]
+        result = self.ns["study_work"](self.cx, COURSE, {"jobid": "work-j", "enc": "e"},
+                                       {"knowledgeid": "k", "ktoken": "t", "cpi": "p"})
+        self.assertEqual(result, StudyResult.SUCCESS)
+        self.ns["decode_questions_info"].assert_not_called()
+        self.tiku.query.assert_not_called()
+        self.session.post.assert_not_called()
+
+    def test_unavailable_completion_check_still_saves_missing_answers(self):
+        self.cx.is_job_finished.side_effect = OSError("offline")
+        result, payload = self.run_work(None)
+        self.assertEqual(result, StudyResult.INCOMPLETE)
+        self.assertEqual(payload["pyFlag"], "1")
 
     def test_card_http_failure_is_not_empty_success(self):
         self.session.get.return_value = types.SimpleNamespace(status_code=403)

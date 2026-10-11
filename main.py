@@ -358,6 +358,22 @@ class JobProcessor:
                 logger.exception("处理章节失败: {}", task.point["title"])
                 task.result = ChapterResult.ERROR
 
+            # 失败或即将耗尽重试时刷新平台状态，避免旧快照造成误判。
+            if task.result in (ChapterResult.ERROR, ChapterResult.INCOMPLETE) or (
+                task.result == ChapterResult.NOT_OPEN and task.tries >= self.max_tries - 1
+            ):
+                try:
+                    latest = self.chaoxing.get_course_point(
+                        self.course["courseId"], self.course["clazzId"], self.course["cpi"]
+                    )["points"]
+                    point = next((p for p in latest if p["id"] == task.point["id"]), None)
+                    if point is not None and point["has_finished"]:
+                        task.point.update(point)
+                        task.result = ChapterResult.SUCCESS
+                        logger.info("刷新平台状态确认章节已完成: {}", task.point["title"])
+                except Exception as exc:
+                    logger.warning("刷新章节完成状态失败，保留原结果: {}", type(exc).__name__)
+
             match task.result:
                 case ChapterResult.SUCCESS:
                     logger.debug("Task success: {}", task.point["title"])

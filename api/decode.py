@@ -15,6 +15,13 @@ from api.font_decoder import FontDecoder
 from api.logger import logger
 
 
+def is_passed(value: Any) -> bool:
+    """只接受平台明确的完成标记；字符串 false/0 不能按真值处理。"""
+    return value is True or value == 1 or (
+        isinstance(value, str) and value.strip().lower() in {"true", "1"}
+    )
+
+
 def decode_course_list(html_text: str) -> List[Dict[str, str]]:
     """
     解析课程列表页面，提取课程信息
@@ -123,7 +130,7 @@ def _extract_points_from_chapter(chapter_unit) -> List[Dict[str, Any]]:
     
     for raw_point in raw_points:
         point = raw_point.div
-        if "id" not in point.attrs:
+        if point is None or not re.fullmatch(r"cur\d{1,20}", point.get("id", "")):
             continue
             
         point_id = re.findall(r"^cur(\d{1,20})$", point.attrs["id"])[0]
@@ -134,12 +141,12 @@ def _extract_points_from_chapter(chapter_unit) -> List[Dict[str, Any]]:
         need_unlock = False
         if point.select_one("input.knowledgeJobCount"):
             job_count = point.select_one("input.knowledgeJobCount").attrs["value"]
-        elif point.select_one("span.bntHoverTips") and "解锁" in point.select_one("span.bntHoverTips").text:
-            need_unlock = True
+        tips = [tip.get_text(strip=True) for tip in point.select("span.bntHoverTips")]
+        need_unlock = any("解锁" in tip for tip in tips)
             
         # 判断是否已完成
-        is_finished = False
-        if point.select_one("span.bntHoverTips") and "已完成" in point.select_one("span.bntHoverTips").text:
+        is_finished = any("已完成" in tip and "未完成" not in tip for tip in tips)
+        if str(job_count).strip() == "0" and not need_unlock:
             is_finished = True
             
         point_detail = {
@@ -171,12 +178,12 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
         return [], {"notOpen": True}
 
     # 提取mArg参数
-    temp = re.findall(r"mArg=\{(.*?)\};", html_text.replace(" ", ""))
+    temp = re.findall(r"\bmArg\s*=\s*(\{.*?\})\s*;", html_text, re.DOTALL)
     if not temp:
         return [], {}
 
     # 解析JSON数据
-    cards_data = json.loads("{" + temp[0] + "}")
+    cards_data = json.loads(temp[0])
 
     if not cards_data:
         return [], {}
@@ -186,6 +193,9 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
 
     # 处理所有附件任务
     cards = cards_data.get("attachments", [])
+    # 保留已完成任务的 ID，供重跑及重复提交后的核验使用。
+    job_info["completed_job_ids"] = [str(card["jobid"]) for card in cards
+                                     if card.get("jobid") and is_passed(card.get("isPassed"))]
     job_list = _process_attachment_cards(cards)
 
     return job_list, job_info
@@ -231,7 +241,7 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
     
     for index, card in enumerate(cards):
         # 跳过已通过的任务
-        if card.get("isPassed", False):
+        if is_passed(card.get("isPassed")):
             continue
 
         # 处理无job字段的特殊任务

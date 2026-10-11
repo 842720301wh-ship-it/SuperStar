@@ -346,6 +346,7 @@ class Chaoxing:
         self.rate_limiter.limit_rate()
         job_list = []
         job_info = {}
+        completed_job_ids = set()
         cards_params = {
             "clazzid": course["clazzId"],
             "courseid": course["courseId"],
@@ -372,16 +373,40 @@ class Chaoxing:
                 logger.info("该章节未开放")
                 return [], _job_info
 
+            completed_job_ids.update(_job_info.get("completed_job_ids", []))
+            for job in _job_list:
+                job["card_num"] = _possible_num
             job_list += _job_list
             job_info.update(_job_info)
 
-        if not job_list:
+        job_info["completed_job_ids"] = sorted(completed_job_ids)
+        if not job_list and not completed_job_ids:
             job_info["emptyPageResult"] = self.study_emptypage(course, point)
+        elif not job_list:
+            logger.info("该章节的任务点已完成，跳过执行")
 
         logger.trace(f"原始任务点列表内容:\n{_resp.text}")
         logger.info("章节任务点读取成功...")
 
         return job_list, job_info
+
+    def is_job_finished(self, course: dict, job: dict, job_info: dict) -> bool:
+        """重新读取任务卡片，只凭当前任务的 isPassed 确认完成。"""
+        session = SessionManager.get_session()
+        card_numbers = [job["card_num"]] if "card_num" in job else "0123456"
+        for number in card_numbers:
+            self.rate_limiter.limit_rate()
+            response = session.get(
+                "https://mooc1.chaoxing.com/mooc-ans/knowledge/cards",
+                params={"clazzid": course["clazzId"], "courseid": course["courseId"],
+                        "knowledgeid": job_info["knowledgeid"], "cpi": course["cpi"],
+                        "ut": "s", "mooc2": 1, "num": number, "v": "2025-0424-1038-3"},
+            )
+            response.raise_for_status()
+            _, latest_info = decode_course_card(response.text)
+            if str(job["jobid"]) in latest_info.get("completed_job_ids", []):
+                return True
+        return False
 
     def get_enc(self, clazzId, jobid, objectId, playingTime, duration, userid):
         return md5(
@@ -671,6 +696,16 @@ class Chaoxing:
 
     def study_work(self, _course, _job, _job_info) -> StudyResult:
         # FIXME: 这一块可以单独搞一个类出来了，方法里面又套方法，每一次调用都会创建新的方法，十分浪费
+        def check_finished_work():
+            try:
+                return self.is_job_finished(_course, _job, _job_info)
+            except Exception as exc:
+                logger.warning("核验作业完成状态失败，继续正常处理: {}", type(exc).__name__)
+                return False
+
+        if check_finished_work():
+            logger.info("章节检测任务点已完成，跳过 AI 查询和重复提交")
+            return StudyResult.SUCCESS
         if not self.tiku or self.tiku.DISABLE:
             logger.warning("题库未启用，章节检测尚未完成")
             return StudyResult.INCOMPLETE
@@ -854,6 +889,11 @@ class Chaoxing:
                             if '教师未创建完成该测验' in _resp.text:
                                 raise PermissionError("教师未创建完成该测验")
 
+                            if _resp.status_code == 200 and any(
+                                marker in _resp.text for marker in ("已批阅", "已提交", "不允许重复提交")
+                            ) and check_finished_work():
+                                return (_resp, {"already_finished": True})
+
                             questions = decode_questions_info(_resp.text)
 
                             if _resp.status_code == 200 and questions.get("questions"):
@@ -908,6 +948,10 @@ class Chaoxing:
         except Exception as e:
             logger.error(f"请求失败: {e}")
             return StudyResult.ERROR
+
+        if questions.get("already_finished"):
+            logger.info("平台确认章节检测已完成，跳过重复答题")
+            return StudyResult.SUCCESS
 
         _ORIGIN_HTML_CONTENT = final_resp.text  # 用于配合输出网页源码, 帮助修复#391错误
 
@@ -1047,6 +1091,11 @@ class Chaoxing:
             if res_json["status"]:
                 logger.info(f'{"提交" if questions["pyFlag"] == "" else "保存"}答题成功 -> {res_json["msg"]}')
             else:
+                already_submitted = any(marker in str(res_json.get("msg", ""))
+                                        for marker in ("已批阅", "已提交", "不允许重复提交"))
+                if already_submitted and check_finished_work():
+                    logger.info("重复提交后核验任务点已完成")
+                    return StudyResult.SUCCESS
                 logger.error(f'{"提交" if questions["pyFlag"] == "" else "保存"}答题失败 -> {res_json["msg"]}')
                 return StudyResult.ERROR
         else:
