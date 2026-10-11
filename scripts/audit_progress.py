@@ -8,12 +8,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bs4 import BeautifulSoup
 from api.base import SessionManager
-from api.decode import decode_course_point, is_passed
+from api.decode import decode_course_card, decode_course_point, is_passed
 from api.logger import configure_console_logger
 from main import init_chaoxing, load_config_from_file
 
 
-def inspect_course(chaoxing, course):
+def inspect_course(chaoxing, course, prefixes):
     session = SessionManager.get_session()
     response = session.get(
         "https://mooc2-ans.chaoxing.com/mooc2-ans/mycourse/studentcourse",
@@ -31,8 +31,7 @@ def inspect_course(chaoxing, course):
                  "style": tag.get("style", ""), "parent_class": tag.parent.get("class", [])}
                 for tag in node.select("span.bntHoverTips")] if node else []
         print("AUDIT_CHAPTER " + json.dumps(dict(point, tips=tips), ensure_ascii=False), flush=True)
-        # 抓取第一个阻塞点及截图涉及的李白章节，避免诊断本身耗时过长。
-        if not point["title"].startswith(("1.1 ", "1.2 ", "4.1 ", "4.2 ", "4.3 ", "4.4 ")):
+        if not point["title"].startswith(tuple(prefixes)):
             continue
         for number in "0123456":
             chaoxing.rate_limiter.limit_rate()
@@ -47,11 +46,17 @@ def inspect_course(chaoxing, course):
                       "not_open": "章节未开放" in card_response.text, "parsed": bool(matched),
                       "tasks": [{"id": card.get("jobid"), "type": card.get("type"),
                                  "job": card.get("job"), "isPassed": card.get("isPassed"),
+                                 "property_keys": sorted(card.get("property", {})),
                                  "passed": is_passed(card.get("isPassed")),
                                  "playTime": card.get("playTime"),
                                  "name": card.get("property", {}).get("name", card.get("property", {}).get("title", ""))}
                                 for card in cards]}
             print("AUDIT_CARD " + json.dumps(status, ensure_ascii=False), flush=True)
+            jobs, info = decode_course_card(card_response.text)
+            print("AUDIT_DECODE " + json.dumps({"chapter": point["title"], "card": number,
+                "pending_jobs": [{"id": job.get("jobid"), "type": job.get("type")} for job in jobs],
+                "completed_job_ids": info.get("completed_job_ids", []),
+                "unprocessed_count": info.get("unprocessed_count", 0)}, ensure_ascii=False), flush=True)
             if status["not_open"]:
                 break
 
@@ -59,6 +64,7 @@ def inspect_course(chaoxing, course):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config.ini")
+    parser.add_argument("--chapter-prefix", nargs="+", default=["1.1 ", "1.2 ", "4.1 ", "4.2 ", "4.3 ", "4.4 "])
     args = parser.parse_args()
     common, tiku, _ = load_config_from_file(args.config)
     tiku["check_llm_connection"] = "false"
@@ -71,7 +77,7 @@ def main():
     if not courses:
         raise RuntimeError("未找到指定课程")
     for course in courses:
-        inspect_course(chaoxing, course)
+        inspect_course(chaoxing, course, args.chapter_prefix)
 
 
 if __name__ == "__main__":
