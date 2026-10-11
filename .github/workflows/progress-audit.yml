@@ -1,0 +1,40 @@
+name: 只读核对章节锁定
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/progress-audit.yml
+      - scripts/audit_progress.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  Audit:
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[progress-audit]') }}
+    name: '核对原任务 #${{ matrix.original_run }}'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - original_run: 24
+            source_sha: c319373c515a33fa7affba1b94f7ef735076ddfb
+          - original_run: 28
+            source_sha: c6bc6cc393262d609f29aa1072fe995b872888d1
+          - original_run: 36
+            source_sha: 0f69705d35fa69d9252fe26966668c721d1ebecb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt
+      - run: python scripts/replay_config.py "${{ matrix.source_sha }}"
+      - name: 只读检查课程完成标记与任务卡片
+        run: python -u scripts/audit_progress.py --config config.ini

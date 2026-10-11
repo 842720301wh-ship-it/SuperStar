@@ -341,7 +341,7 @@ class Chaoxing:
         logger.info("课程章节读取成功...")
         return decode_course_point(_resp.text)
 
-    def get_job_list(self, course: dict, point: dict) -> tuple[list[dict], dict]:
+    def get_job_list(self, course: dict, point: dict, *, mark_empty: bool = True) -> tuple[list[dict], dict]:
         _session = SessionManager.get_session()
         self.rate_limiter.limit_rate()
         job_list = []
@@ -380,7 +380,7 @@ class Chaoxing:
             job_info.update(_job_info)
 
         job_info["completed_job_ids"] = sorted(completed_job_ids)
-        if not job_list and not completed_job_ids:
+        if mark_empty and not job_list and not completed_job_ids:
             job_info["emptyPageResult"] = self.study_emptypage(course, point)
         elif not job_list:
             logger.info("该章节的任务点已完成，跳过执行")
