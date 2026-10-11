@@ -57,6 +57,9 @@ jobs:
           submit=true
           ; 最低题库覆盖率，达到才提交
           cover_rate=0.5
+          auto_submit=true
+          ai_retry_times=3
+          fallback_model=LongCat-2.5-Preview
           ; 搜索多个题目的间隔，单位秒
           delay=1.0
           true_list=正确,对,√,是

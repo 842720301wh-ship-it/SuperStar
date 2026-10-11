@@ -1,4 +1,5 @@
 import configparser
+import copy
 import json
 import os
 import random
@@ -27,26 +28,40 @@ __all__ = ["CacheDAO", "Tiku", "TikuFallback", "TikuYanxi", "TikuGo", "TikuLike"
 
 
 def retry_ai_answer(func):
-    """AI 查询无有效答案或请求异常时重试一次，最多调用两次。"""
+    """每个模型首次请求后最多重试三次，再切换备用模型。"""
     @wraps(func)
     def wrapper(self, q_info):
-        for attempt in range(2):
-            try:
-                answer = func(self, q_info)
-                if q_info['type'] == 'completion':
-                    answer = normalize_completion_answer(answer, q_info.get('blank_count', 1))
-                elif q_info['type'] == 'shortanswer':
-                    answer = normalize_shortanswer_answer(answer)
-                elif isinstance(answer, str):
-                    answer = answer.strip()
-                if answer and check_answer(answer, q_info['type'], self):
-                    return answer
-            except Exception as exc:
-                logger.warning("AI 查询异常 ({}/2): {}", attempt + 1, type(exc).__name__)
-            if attempt == 0:
-                logger.warning("AI 未返回有效答案，稍后重试一次: {}", q_info['title'])
-                time.sleep(1)
-        logger.warning("AI 两次查询均未取得有效答案: {}", q_info['title'])
+        attempts = max(0, int(getattr(self, 'ai_retry_times', 3))) + 1
+        model_field = 'model' if hasattr(self, 'model') else 'model_name'
+        primary_model = getattr(self, model_field, '')
+        fallback_model = getattr(self, 'fallback_model', '')
+        providers = [self]
+        if fallback_model and fallback_model != primary_model:
+            # 不修改共享实例的 model，避免并发题目切换模型时相互干扰。
+            backup = copy.copy(self)
+            setattr(backup, model_field, fallback_model)
+            providers.append(backup)
+        for index, provider in enumerate(providers):
+            model = getattr(provider, model_field, 'AI')
+            if index:
+                logger.warning("主模型未取得答案，切换备用模型: {}", model)
+            for attempt in range(attempts):
+                try:
+                    answer = func(provider, q_info)
+                    if q_info['type'] == 'completion':
+                        answer = normalize_completion_answer(answer, q_info.get('blank_count', 1))
+                    elif q_info['type'] == 'shortanswer':
+                        answer = normalize_shortanswer_answer(answer)
+                    elif isinstance(answer, str):
+                        answer = answer.strip()
+                    if answer and check_answer(answer, q_info['type'], provider):
+                        return answer
+                except Exception as exc:
+                    logger.warning("AI 查询异常，模型 {} ({}/{}): {}", model, attempt + 1, attempts, type(exc).__name__)
+                if attempt < attempts - 1:
+                    logger.warning("AI 未返回有效答案，准备第 {} 次重试: {}", attempt + 1, q_info['title'])
+                    time.sleep(1)
+        logger.warning("AI 主模型及备用模型均未取得有效答案: {}", q_info['title'])
         return None
     return wrapper
 
@@ -207,6 +222,7 @@ class Tiku:
             # 设置提交模式
             self.SUBMIT = True if self._conf['submit'] == 'true' else False
             self.COVER_RATE = float(self._conf['cover_rate'])
+            self.AUTO_SUBMIT = str(self._conf.get('auto_submit', 'true')).strip().lower() == 'true'
             self.true_list = self._conf['true_list'].split(',')
             self.false_list = self._conf['false_list'].split(',')
             # 调用自定义题库初始化
@@ -1160,6 +1176,8 @@ class AI(Tiku):
         self.model = self._conf['model']
         self.http_proxy = self._conf['http_proxy']
         self.min_interval_seconds = int(self._conf['min_interval_seconds'])
+        self.ai_retry_times = int(self._conf.get('ai_retry_times', 3))
+        self.fallback_model = self._conf.get('fallback_model', 'LongCat-2.5-Preview').strip()
 
     def check_llm_connection(self) -> bool:
         """
@@ -1170,9 +1188,9 @@ class AI(Tiku):
         try:
             if self.http_proxy:
                 httpx_client = httpx.Client(proxy=self.http_proxy)
-                client = OpenAI(http_client=httpx_client, base_url=self.endpoint, api_key=self.key)
+                client = OpenAI(http_client=httpx_client, base_url=self.endpoint, api_key=self.key, max_retries=0, timeout=30)
             else:
-                client = OpenAI(base_url=self.endpoint, api_key=self.key)
+                client = OpenAI(base_url=self.endpoint, api_key=self.key, max_retries=0, timeout=30)
 
             # 发送一个简单的测试请求
             self._wait_for_interval()
@@ -1294,6 +1312,8 @@ class SiliconFlow(Tiku):
         self.api_key = self._conf['siliconflow_key']
 
         self.model_name = self._conf.get('siliconflow_model', 'deepseek-ai/DeepSeek-V3')
+        self.ai_retry_times = int(self._conf.get('ai_retry_times', 3))
+        self.fallback_model = self._conf.get('fallback_model', 'LongCat-2.5-Preview').strip()
 
 
         self.min_interval = int(self._conf.get('min_interval_seconds', 3))

@@ -27,6 +27,11 @@ def parse_workflow_config(workflow_text):
 def write_replay_config(workflow_text, output_path):
     config = parse_workflow_config(workflow_text)
     config.set("tiku", "cover_rate", "0.5")
+    config.set("tiku", "submit", "true")
+    config.set("tiku", "auto_submit", "true")
+    config.set("tiku", "ai_retry_times", "3")
+    config.set("tiku", "fallback_model", "LongCat-2.5-Preview")
+    config.set("tiku", "check_llm_connection", "false")
     with Path(output_path).open("w", encoding="utf8") as output:
         config.write(output)
     Path(output_path).chmod(0o600)

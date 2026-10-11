@@ -713,6 +713,19 @@ class Chaoxing:
 
         def random_answer(options: str) -> str:
             answer = ""
+            if q["type"] == "completion":
+                if not q.get("blank_fields") and q.get("blank_count", 1) != 1:
+                    return ""
+                blanks = [random.choice(("发展", "变化", "影响", "规律"))
+                          for _ in range(q.get("blank_count", 1))]
+                q["blank_answers"] = blanks
+                logger.warning("填空题未取得答案，逐空填入兜底答案")
+                return "\n".join(blanks)
+            if q["type"] == "shortanswer":
+                logger.warning("简答题未取得答案，填入兜底正文")
+                return "应结合相关概念和实际情况，分析其主要特点、形成原因及影响，并从不同角度说明其作用。"
+            if q["type"] == "judgement":
+                return random.choice(("true", "false"))
             if not options:
                 return answer
 
@@ -763,10 +776,6 @@ class Chaoxing:
                 answer = "".join(sorted(answer))
             elif q["type"] == "single":
                 answer = random.choice(options.split("\n"))[:1]  # 取首字为答案, 例如A或B
-            # 判断题处理
-            elif q["type"] == "judgement":
-                # answer = self.tiku.jugement_select(_answer)
-                answer = "true" if random.choice([True, False]) else "false"
             logger.info(f"随机选择 -> {answer}")
             return answer
 
@@ -963,7 +972,11 @@ class Chaoxing:
             # 添加搜题延迟 #428 - 默认0s延迟
             query_delay = self.kwargs.get("query_delay", 0)
             time.sleep(query_delay)
-            res = self.tiku.query(q)
+            try:
+                res = self.tiku.query(q)
+            except Exception as exc:
+                logger.warning("题库查询失败，使用兜底答案: {}", type(exc).__name__)
+                res = None
             answer = ""
             if not res:
                 # 随机答题
@@ -1020,7 +1033,7 @@ class Chaoxing:
 
                 if not answer:  # 检查 answer 是否为空
                     logger.warning(f"找到答案但答案未能匹配 -> {res}")
-                    answer = "" if q["type"] in ("completion", "shortanswer") else random_answer(q["options"])
+                    answer = random_answer(q["options"])
                     q[f'answerSource{q["id"]}'] = "random"
                 else:
                     logger.info(f"成功获取到答案：{answer}")
@@ -1032,7 +1045,10 @@ class Chaoxing:
         cover_rate = (found_answers / total_questions) * 100
         logger.info(f"章节检测题库覆盖率： {cover_rate:.0f}%")
         # 提交模式  现在与题库绑定,留空直接提交, 1保存但不提交
-        if self.tiku.get_submit_params() == "1":
+        if getattr(self.tiku, "AUTO_SUBMIT", False) is True:
+            questions["pyFlag"] = ""
+            logger.info("全自动模式：含兜底答案时也自动提交，AI 覆盖率不阻止提交")
+        elif self.tiku.get_submit_params() == "1":
             questions["pyFlag"] = "1"
         elif cover_rate >= self.tiku.COVER_RATE * 100 or self.rollback_times >= 1:
             questions["pyFlag"] = ""

@@ -219,7 +219,7 @@ class WorkSubmissionTests(unittest.TestCase):
         self.session = Mock()
         self.session.get.return_value = types.SimpleNamespace(status_code=200, text="question page")
         self.session.post.return_value = types.SimpleNamespace(status_code=200, json=lambda: {"status": True, "msg": "ok"})
-        self.tiku = Mock(DISABLE=False, COVER_RATE=0.9)
+        self.tiku = Mock(DISABLE=False, COVER_RATE=0.9, AUTO_SUBMIT=False)
         self.tiku.get_submit_params.return_value = ""
         self.cx = types.SimpleNamespace(tiku=self.tiku, kwargs={}, rollback_times=0,
                                         is_job_finished=Mock(return_value=False))
@@ -239,6 +239,9 @@ class WorkSubmissionTests(unittest.TestCase):
         if question_type == "shortanswer":
             q.update(type="shortanswer", shortanswer_field=answer_field)
             q["answerField"]["answertype123"] = "4"
+        elif question_type in ("single", "multiple", "judgement"):
+            q.update(type=question_type, options="A. 甲\nB. 乙\nC. 丙" if question_type != "judgement" else "")
+            q["answerField"]["answertype123"] = {"single": "0", "multiple": "1", "judgement": "3"}[question_type]
         self.ns["decode_questions_info"].return_value = {"questions": [q]}
         self.tiku.query.return_value = answer
         self.tiku.get_submit_params.return_value = submit
@@ -267,22 +270,66 @@ class WorkSubmissionTests(unittest.TestCase):
         self.assertEqual(result, StudyResult.SUCCESS)
         self.assertEqual(payload["answer123"], "完整简答正文")
 
-    def test_missing_shortanswer_forces_save_with_zero_threshold(self):
+    def test_missing_shortanswer_gets_nonempty_fallback(self):
         result, payload = self.run_work(" ", question_type="shortanswer", threshold=0)
-        self.assertEqual(result, StudyResult.INCOMPLETE)
-        self.assertEqual(payload["pyFlag"], "1")
-        self.assertEqual(payload["answer123"], "")
+        self.assertEqual(result, StudyResult.SUCCESS)
+        self.assertEqual(payload["pyFlag"], "")
+        self.assertTrue(payload["answer123"])
 
     def test_shortanswer_save_does_not_count_as_completed(self):
         result, payload = self.run_work("完整正文", question_type="shortanswer", submit="1")
         self.assertEqual(result, StudyResult.INCOMPLETE)
         self.assertEqual(payload["answer123"], "完整正文")
 
-    def test_missing_blank_forces_save_even_with_zero_threshold(self):
+    def test_missing_blank_gets_fallback_for_every_slot(self):
         result, payload = self.run_work(["甲"], threshold=0)
+        self.assertEqual(result, StudyResult.SUCCESS)
+        self.assertEqual(payload["pyFlag"], "")
+        self.assertTrue(payload["answerEditor1231"])
+        self.assertTrue(payload["answerEditor1232"])
+
+    def test_automatic_mode_submits_with_zero_ai_coverage(self):
+        self.tiku.AUTO_SUBMIT = True
+        for question_type in ("completion", "shortanswer"):
+            with self.subTest(question_type=question_type):
+                result, payload = self.run_work(None, question_type=question_type, threshold=0.5)
+                self.assertEqual(result, StudyResult.SUCCESS)
+                self.assertEqual(payload["pyFlag"], "")
+
+    def test_query_exception_uses_fallback_and_submits(self):
+        self.tiku.AUTO_SUBMIT = True
+        self.tiku.query.side_effect = ConnectionError("offline")
+        result, payload = self.run_work(None)
+        self.assertEqual(result, StudyResult.SUCCESS)
+        self.assertTrue(payload["answerEditor1231"])
+        self.assertTrue(payload["answerEditor1232"])
+        self.assertEqual(payload["pyFlag"], "")
+
+    def test_all_objective_questions_get_fallback_and_submit(self):
+        self.tiku.AUTO_SUBMIT = True
+        for kind in ("single", "multiple", "judgement"):
+            with self.subTest(kind=kind):
+                result, payload = self.run_work(None, question_type=kind)
+                self.assertEqual(result, StudyResult.SUCCESS)
+                self.assertEqual(payload["pyFlag"], "")
+                answer = payload["answer123"]
+                if kind == "judgement":
+                    self.assertIn(answer, ("true", "false"))
+                else:
+                    self.assertTrue(set(answer).issubset(set("ABC")))
+                    self.assertIn(len(answer), (1,) if kind == "single" else (2, 3))
+
+    def test_automatic_mode_has_priority_over_save_setting(self):
+        self.tiku.AUTO_SUBMIT = True
+        result, payload = self.run_work(None, submit="1")
+        self.assertEqual(result, StudyResult.SUCCESS)
+        self.assertEqual(payload["pyFlag"], "")
+
+    def test_unknown_multiblank_fields_still_do_not_fake_completion(self):
+        self.tiku.AUTO_SUBMIT = True
+        result, payload = self.run_work(None, fields=[])
         self.assertEqual(result, StudyResult.INCOMPLETE)
         self.assertEqual(payload["pyFlag"], "1")
-        self.assertEqual(payload["answerEditor1232"], "")
 
     def test_explicit_save_is_incomplete(self):
         result, payload = self.run_work(["甲", "乙"], submit="1")
@@ -412,7 +459,7 @@ class AnswerCacheTests(unittest.TestCase):
 
 class AIRetryTests(unittest.TestCase):
     def setUp(self):
-        self.ns = {"wraps": wraps, "logger": Mock(), "time": Mock(), "check_answer": check_answer,
+        self.ns = {"wraps": wraps, "copy": copy, "logger": Mock(), "time": Mock(), "check_answer": check_answer,
                    "normalize_completion_answer": normalize_completion_answer,
                    "normalize_shortanswer_answer": normalize_shortanswer_answer}
         load_definitions("api/answer.py", {"retry_ai_answer"}, self.ns)
@@ -442,12 +489,41 @@ class AIRetryTests(unittest.TestCase):
                 self.assertEqual(self.query(raw), "恢复后的正文")
                 self.assertEqual(raw.call_count, 2)
 
-    def test_second_failure_stops(self):
-        for failures in ([None, None], [TimeoutError(), ConnectionError()], [None, " "]):
+    def test_three_retries_stop_after_four_requests(self):
+        for failures in ([None] * 4, [TimeoutError(), ConnectionError(), TimeoutError(), None], [None, " ", [], None]):
             with self.subTest(failures=failures):
                 raw = Mock(side_effect=failures)
                 self.assertIsNone(self.query(raw))
-                self.assertEqual(raw.call_count, 2)
+                self.assertEqual(raw.call_count, 4)
+
+    def test_third_retry_can_recover(self):
+        raw = Mock(side_effect=[None, TimeoutError(), " ", "恢复后的正文"])
+        self.assertEqual(self.query(raw), "恢复后的正文")
+        self.assertEqual(raw.call_count, 4)
+
+    def test_fallback_model_uses_own_retries_without_mutating_primary(self):
+        self.tiku.model = "primary"
+        self.tiku.fallback_model = "LongCat-2.5-Preview"
+        models = []
+        def raw(provider, question):
+            models.append(provider.model)
+            return "备用模型正文" if provider.model != "primary" else None
+        self.assertEqual(self.query(raw), "备用模型正文")
+        self.assertEqual(models, ["primary"] * 4 + ["LongCat-2.5-Preview"])
+        self.assertEqual(self.tiku.model, "primary")
+
+    def test_both_models_stop_after_bounded_retries(self):
+        self.tiku.model_name = "primary"
+        self.tiku.fallback_model = "LongCat-2.5-Preview"
+        raw = Mock(return_value=None)
+        self.assertIsNone(self.query(raw))
+        self.assertEqual(raw.call_count, 8)
+
+    def test_same_backup_model_is_not_requested_twice(self):
+        self.tiku.model = self.tiku.fallback_model = "primary"
+        raw = Mock(return_value=None)
+        self.assertIsNone(self.query(raw))
+        self.assertEqual(raw.call_count, 4)
 
     def test_incomplete_blank_answer_retries(self):
         raw = Mock(side_effect=[["甲"], ["甲", "乙"]])
@@ -475,7 +551,7 @@ class AIRetryTests(unittest.TestCase):
 class AIAnswerTests(unittest.TestCase):
     def test_openai_shortanswer_string_and_array_are_parsed(self):
         client = Mock()
-        ns = {"re": re, "json": json, "logger": Mock(), "time": Mock(), "OpenAI": Mock(return_value=client),
+        ns = {"re": re, "json": json, "copy": copy, "logger": Mock(), "time": Mock(), "OpenAI": Mock(return_value=client),
               "normalize_shortanswer_answer": normalize_shortanswer_answer,
               "normalize_completion_answer": normalize_completion_answer, "check_answer": check_answer, "wraps": wraps}
         load_definitions("api/answer.py", {"retry_ai_answer"}, ns)
@@ -497,9 +573,18 @@ class AIAnswerTests(unittest.TestCase):
         self.assertEqual(ns["_query"](tiku, {"type": "shortanswer", "title": "简述原因", "options": ""}), "网络恢复后的正文")
         self.assertEqual(client.chat.completions.create.call_count, 2)
 
+        client.chat.completions.create.reset_mock()
+        tiku.fallback_model = "LongCat-2.5-Preview"
+        client.chat.completions.create.side_effect = [TimeoutError()] * 4 + [types.SimpleNamespace(choices=[
+            types.SimpleNamespace(message=types.SimpleNamespace(content='{"Answer":"备用模型正文"}'))])]
+        self.assertEqual(ns["_query"](tiku, {"type": "shortanswer", "title": "简述原因", "options": ""}), "备用模型正文")
+        self.assertEqual([call.kwargs["model"] for call in client.chat.completions.create.call_args_list],
+                         ["test"] * 4 + ["LongCat-2.5-Preview"])
+        self.assertEqual(tiku.model, "test")
+
     def test_siliconflow_shortanswer_has_prompt_and_preserves_text(self):
         requests = Mock()
-        ns = {"re": re, "json": json, "logger": Mock(), "time": Mock(), "requests": requests,
+        ns = {"re": re, "json": json, "copy": copy, "logger": Mock(), "time": Mock(), "requests": requests,
               "normalize_shortanswer_answer": normalize_shortanswer_answer,
               "normalize_completion_answer": normalize_completion_answer, "check_answer": check_answer, "wraps": wraps}
         load_definitions("api/answer.py", {"retry_ai_answer"}, ns)
@@ -518,6 +603,29 @@ class AIAnswerTests(unittest.TestCase):
         requests.post.side_effect = [failed_response, response]
         self.assertEqual(ns["_query"](tiku, {"type": "shortanswer", "title": "简述原因", "options": ""}), "完整简答")
         self.assertEqual(requests.post.call_count, 2)
+
+        requests.post.reset_mock()
+        tiku.fallback_model = "LongCat-2.5-Preview"
+        requests.post.side_effect = [failed_response] * 4 + [response]
+        self.assertEqual(ns["_query"](tiku, {"type": "shortanswer", "title": "简述原因", "options": ""}), "完整简答")
+        self.assertEqual([call.kwargs["json"]["model"] for call in requests.post.call_args_list],
+                         ["test"] * 4 + ["LongCat-2.5-Preview"])
+        self.assertEqual(tiku.model_name, "test")
+
+
+class UnattendedStartupTests(unittest.TestCase):
+    def test_connection_failure_continues_without_input(self):
+        tiku = Mock()
+        tiku.get_tiku_from_config.return_value = tiku
+        tiku.check_llm_connection.return_value = False
+        ns = {"logger": Mock(), "Account": Mock(), "Tiku": Mock(return_value=tiku), "Chaoxing": Mock()}
+        load_definitions("main.py", {"init_chaoxing"}, ns)
+        with patch("builtins.input") as ask:
+            result = ns["init_chaoxing"]({"username": "test-user", "password": "test-password"},
+                                         {"provider": "AI", "check_llm_connection": "true"})
+        ask.assert_not_called()
+        self.assertIs(result, ns["Chaoxing"].return_value)
+        tiku.check_llm_connection.assert_called_once()
 
 
 if __name__ == "__main__":
