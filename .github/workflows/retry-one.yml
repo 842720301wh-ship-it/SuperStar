@@ -1,0 +1,34 @@
+name: 重试教育学原理任务
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/retry-one.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: history-task-25-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Retry:
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[retry-task]') }}
+    name: '重试原任务 #25（修复空目录章节）'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install -r requirements.txt
+      - name: 恢复原任务账号和课程，启用当前答题配置
+        run: python scripts/replay_config.py 96d308aba1d09c9932435b8813e7385843d18873
+      - name: 用修复代码继续执行未完成章节
+        run: python -u main.py -c config.ini

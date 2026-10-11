@@ -389,7 +389,7 @@ class Chaoxing:
         job_info["unprocessed_count"] = unprocessed_count
         if unprocessed_count:
             raise RuntimeError(f"章节有 {unprocessed_count} 个无法解析的未完成任务点")
-        if not job_list and not completed_job_ids and not parsed_cards and str(point.get("jobCount", 1)) != "0":
+        if not job_list and not completed_job_ids and not parsed_cards:
             raise RuntimeError("章节仍有任务点但未读取到有效任务卡片，不能当作空页面完成")
         if mark_empty and not point.get("has_finished") and not job_list and not completed_job_ids:
             job_info["emptyPageResult"] = self.study_emptypage(course, point)

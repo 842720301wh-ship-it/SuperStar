@@ -86,6 +86,12 @@ class SequentialUnlockTests(unittest.TestCase):
                 self.assertEqual(self.ns["verify_chapter_finished"](self.cx, COURSE, dict(self.first)), expected)
                 self.assertFalse(self.cx.get_job_list.call_args.kwargs["mark_empty"])
 
+    def test_completed_heading_without_count_or_cards_can_advance(self):
+        self.cx.get_course_point.return_value = {"points": [dict(self.first, has_finished=True, jobCount=0)]}
+        self.cx.get_job_list.return_value = ([], {"card_parsed": True, "empty_card": True})
+        self.assertTrue(self.ns["verify_chapter_finished"](self.cx, COURSE, dict(self.first)))
+        self.assertEqual(self.cx.get_course_point.call_count, 1)
+
     def test_courses_with_locks_automatically_use_sequential_processing(self):
         for locked, configured in ((True, False), (False, True)):
             with self.subTest(locked=locked, configured=configured):

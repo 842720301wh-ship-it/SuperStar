@@ -479,7 +479,7 @@ def verify_chapter_finished(chaoxing, course, point):
         current = next((item for item in latest if item["id"] == point["id"]), None)
         if current is not None:
             jobs, info = chaoxing.get_job_list(course, current, mark_empty=False)
-            confirmed_cards = info.get("completed_job_ids") or info.get("card_parsed") or str(current.get("jobCount", 1)) == "0"
+            confirmed_cards = info.get("completed_job_ids") or info.get("card_parsed")
             if current["has_finished"] and confirmed_cards and not jobs and not info.get("notOpen") and not info.get("unprocessed_count"):
                 point.update(current)
                 return True
@@ -511,8 +511,10 @@ def run_sequential_chapters(chaoxing, course, tasks, speed):
                     task.result = ChapterResult.INCOMPLETE
             except Exception as exc:
                 logger.warning("顺序章节处理异常: {}，{}", task.point["title"], type(exc).__name__)
+                if isinstance(exc, RuntimeError) and str(exc).startswith(("章节", "平台章节列表")):
+                    logger.warning("章节失败原因: {}", str(exc))
                 task.result = ChapterResult.ERROR
-            logger.warning("前置章节未完成，重试当前章节 ({}/5): {}，状态={}",
+            logger.warning("当前章节处理或核验未通过，重试 ({}/5): {}，状态={}",
                            attempt + 1, task.point["title"], task.result.name)
             if attempt < 4:
                 time.sleep(2)

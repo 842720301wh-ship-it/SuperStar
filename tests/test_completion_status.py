@@ -56,6 +56,14 @@ class CompletionParsingTests(unittest.TestCase):
             self.assertEqual(jobs, [])
             self.assertFalse(info.get("completed_job_ids"))
 
+    def test_platform_empty_string_card_is_valid_without_tasks(self):
+        for value in ('""', "''"):
+            jobs, info = self.ns["decode_course_card"]('<script>var mArg = ' + value + ';</script>暂无内容')
+            self.assertEqual(jobs, [])
+            self.assertTrue(info["card_parsed"])
+            self.assertTrue(info["empty_card"])
+            self.assertEqual(info["unprocessed_count"], 0)
+
     def test_platform_removes_job_flag_from_finished_work(self):
         # 实际只读核对：已完成作业没有 isPassed，平台移除了 job 标记。
         card = work_card(passed=None)
@@ -88,6 +96,24 @@ class CompletionParsingTests(unittest.TestCase):
                 parsed = self.ns["_extract_points_from_chapter"](chapter)[0]
                 self.assertEqual(parsed["has_finished"], finished)
                 self.assertEqual(parsed["need_unlock"], any("解锁" in t for t in tips))
+
+    def test_missing_count_on_completed_heading_does_not_invent_pending_task(self):
+        # 真实 5.1 教师：已完成标记存在，knowledgeJobCount 字段不存在。
+        for tips, expected_count, finished in ((["已完成"], 0, True),
+                                              (["未完成"], 1, False),
+                                              ([], 1, False),
+                                              (["已完成", "需要解锁"], 1, True)):
+            with self.subTest(tips=tips):
+                point = Mock(attrs={"id": "cur1230998390"})
+                point.get.side_effect = point.attrs.get
+                point.select_one.side_effect = lambda selector: (
+                    types.SimpleNamespace(text="5.1 教师") if selector == "a.clicktitle" else None)
+                point.select.return_value = [types.SimpleNamespace(get_text=lambda strip=True, t=t: t) for t in tips]
+                chapter = Mock()
+                chapter.find_all.return_value = [types.SimpleNamespace(div=point)]
+                parsed = self.ns["_extract_points_from_chapter"](chapter)[0]
+                self.assertEqual(parsed["jobCount"], expected_count)
+                self.assertEqual(parsed["has_finished"], finished)
 
 
 class CompletionRequestTests(unittest.TestCase):
@@ -150,6 +176,27 @@ class CompletionRequestTests(unittest.TestCase):
     def test_readonly_inspection_never_marks_empty_page_completed(self):
         self.session.get.return_value = self.response(card_page([]))
         self.ns["get_job_list"](self.cx, COURSE, POINT, mark_empty=False)
+        self.cx.study_emptypage.assert_not_called()
+
+    def test_completed_heading_without_task_cards_never_writes_completion(self):
+        self.session.get.return_value = self.response('mArg = "";')
+        jobs, info = self.ns["get_job_list"](self.cx, COURSE,
+            dict(POINT, has_finished=True, jobCount=0))
+        self.assertEqual(jobs, [])
+        self.assertEqual(info["unprocessed_count"], 0)
+        self.cx.study_emptypage.assert_not_called()
+
+    def test_login_page_cannot_confirm_even_zero_count_completed_heading(self):
+        self.session.get.return_value = self.response('登录页面')
+        with self.assertRaisesRegex(RuntimeError, "未读取到有效任务卡片"):
+            self.ns["get_job_list"](self.cx, COURSE, dict(POINT, has_finished=True, jobCount=0))
+        self.cx.study_emptypage.assert_not_called()
+
+    def test_pending_card_in_zero_count_heading_still_executes(self):
+        self.session.get.side_effect = [self.response(card_page([work_card()]))] + [self.response('mArg = "";')] * 6
+        jobs, _ = self.ns["get_job_list"](self.cx, COURSE,
+            dict(POINT, has_finished=True, jobCount=0))
+        self.assertEqual([job["jobid"] for job in jobs], ["work-j"])
         self.cx.study_emptypage.assert_not_called()
 
     def test_finished_work_without_ispassed_can_be_confirmed(self):

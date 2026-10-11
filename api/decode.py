@@ -137,7 +137,7 @@ def _extract_points_from_chapter(chapter_unit) -> List[Dict[str, Any]]:
         point_title = point.select_one("a.clicktitle").text.replace("\n", "").strip()
         
         # 提取任务数量
-        job_count = 1  # 默认为1
+        job_count = None
         need_unlock = False
         if point.select_one("input.knowledgeJobCount"):
             job_count = point.select_one("input.knowledgeJobCount").attrs["value"]
@@ -146,6 +146,10 @@ def _extract_points_from_chapter(chapter_unit) -> List[Dict[str, Any]]:
             
         # 判断是否已完成
         is_finished = any("已完成" in tip and "未完成" not in tip for tip in tips)
+        # 平台的已完成目录章节可能没有数量字段，也没有任务卡片。
+        # 缺失字段不能凭空生成一个待完成任务；未完成章节仍保守按 1 处理。
+        if job_count is None:
+            job_count = 0 if is_finished and not need_unlock else 1
         if str(job_count).strip() == "0" and not need_unlock:
             is_finished = True
             
@@ -180,6 +184,10 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
     # 提取mArg参数
     temp = re.findall(r"\bmArg\s*=\s*(\{.*?\})\s*;", html_text, re.DOTALL)
     if not temp:
+        # 平台正常的「暂无内容」卡片使用空字符串，不是 JSON 对象。
+        if re.search(r'\bmArg\s*=\s*(?:""|\x27\x27)\s*;', html_text):
+            return [], {"card_parsed": True, "empty_card": True,
+                        "completed_job_ids": [], "unprocessed_count": 0}
         return [], {}
 
     # 解析JSON数据
