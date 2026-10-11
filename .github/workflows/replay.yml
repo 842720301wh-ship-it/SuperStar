@@ -11,15 +11,70 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: history-replay-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  PrepareBatch:
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[replay-batch]') }}
+    name: 取消旧批次，准备并发运行
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: 取消仍在运行或排队的旧批次
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const repo = context.repo;
+            const { data: current } = await github.rest.actions.getWorkflowRun({
+              ...repo, run_id: context.runId
+            });
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              ...repo, workflow_id: current.workflow_id,
+              branch: current.head_branch, per_page: 100
+            });
+            const active = new Set(['queued', 'in_progress', 'waiting', 'pending', 'requested']);
+            const older = runs.filter(run =>
+              run.run_number < current.run_number && active.has(run.status)
+            );
+            for (const run of older) {
+              core.info(`取消旧批次 ${run.id} (${run.status})`);
+              try {
+                await github.rest.actions.cancelWorkflowRun({ ...repo, run_id: run.id });
+              } catch (error) {
+                const { data: latest } = await github.rest.actions.getWorkflowRun({
+                  ...repo, run_id: run.id
+                });
+                if (latest.status !== 'completed') throw error;
+              }
+            }
+            for (let attempt = 0; attempt < 40; attempt++) {
+              const states = await Promise.all(older.map(async run => {
+                const { data } = await github.rest.actions.getWorkflowRun({
+                  ...repo, run_id: run.id
+                });
+                return data;
+              }));
+              if (states.every(run => run.status === 'completed')) {
+                core.info('旧批次已停止，开始并发执行全部 15 个任务');
+                return;
+              }
+              await new Promise(resolve => setTimeout(resolve, 3000));
+            }
+            throw new Error('旧批次尚未停止，请查看取消状态后重新运行');
+
   Replay:
+    needs: PrepareBatch
     if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[replay-batch]') }}
     name: '重跑原任务 #${{ matrix.original_run }}'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 15
       matrix:
         include:
           - original_run: 24
