@@ -44,6 +44,9 @@ def inspect_course(chaoxing, course, prefixes):
             cards = json.loads(matched[1]).get("attachments", []) if matched else []
             status = {"chapter": point["title"], "card": number,
                       "not_open": "章节未开放" in card_response.text, "parsed": bool(matched),
+                      "page_title": BeautifulSoup(card_response.text, "lxml").title.get_text(strip=True) if BeautifulSoup(card_response.text, "lxml").title else "",
+                      "empty_marg": bool(search(r'\bmArg\s*=\s*(?:""|\x27\x27)\s*;', card_response.text)),
+                      "page_text": BeautifulSoup(card_response.text, "lxml").get_text(" ", strip=True)[:400] if not matched else "",
                       "tasks": [{"id": card.get("jobid"), "type": card.get("type"),
                                  "job": card.get("job"), "isPassed": card.get("isPassed"),
                                  "property_keys": sorted(card.get("property", {})),
